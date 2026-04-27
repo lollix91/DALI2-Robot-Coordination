@@ -140,13 +140,12 @@ solicit_bidsI :>
     member(Vid, Tasks),
     \+ believes(assigned(Vid, _)),
     \+ believes(assigned_pair(Vid, _, _)),
-    \+ has_past(soliciting(Vid)),
-    believes(victim_info(Vid, X, Y, Weight)),
-    log("Soliciting bids for ~w (weight=~w)", [Vid, Weight]),
+    \+ believes(soliciting(Vid)),
+    believes(victim_info(Vid, X, Y, W)),
+    log("Soliciting bids for ~w (weight=~w)", [Vid, W]),
     assert_belief(soliciting(Vid)),
-    broadcast(request_bid(Vid, X, Y, Weight)).
-internal_event(solicit_bids, 0, forever, true, forever).
-past_event(soliciting(_), 8).      %% allow re-solicitation if no winners
+    broadcast(request_bid(Vid, X, Y, W)).
+internal_event(solicit_bids, 2, forever, true, forever).      %% allow re-solicitation if no winners
 
 %% Award task to lowest-cost bidder (light victim) or two lowest (heavy).
 award_taskI :>

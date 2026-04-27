@@ -74,7 +74,9 @@ DEFAULT_VICTIMS = [
 DEPOT_XY    = (0.0,  4.7)
 CHARGER_XY  = (-4.7, -4.7)
 
-DETECTION_RADIUS = 1.5      # m -- victim sensing
+DETECTION_RADIUS = 8.0      # m -- victim sensing (covers full 10x10 arena;
+                            #   models a "satellite reconnaissance" feed,
+                            #   set lower to require physical exploration)
 ARRIVAL_RADIUS   = 0.40     # m -- consider target reached
 WHEEL_BASE       = 0.331    # m -- Pioneer P3DX
 WHEEL_RADIUS     = 0.0975   # m -- Pioneer P3DX

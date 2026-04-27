@@ -63,31 +63,55 @@ CHARGER_XY  = (-4.7, -4.7)
 # --------------------------------------------------------------------------
 
 def safe_remove(sim, alias: str) -> None:
-    try:
-        h = sim.getObject(f"/{alias}")
-        sim.removeModel(h)
-    except Exception:
+    """Remove an object/model identified by alias if present.
+
+    Tries removeModel first, then removeObject. Both calls may raise
+    if the alias points to a stale/half-deleted object; in that case we
+    just swallow the error -- the next loadModel/createPrimitiveShape
+    will create a brand-new instance under the same alias."""
+    for attempt in (sim.removeModel, sim.removeObject):
         try:
             h = sim.getObject(f"/{alias}")
-            sim.removeObject(h)
+            attempt(h)
+            return
         except Exception:
-            pass
+            continue
 
 
 def load_pioneer(sim, model_path: str, alias: str,
                  x: float, y: float, theta: float) -> int:
     safe_remove(sim, alias)
     h = sim.loadModel(model_path)
-    if h == -1:
+    if h is None or h == -1:
         raise RuntimeError(
             f"Could not load Pioneer model from '{model_path}'. "
             "Pass --pioneer-model with an absolute path if necessary."
+        )
+    # Validate the handle: setObjectAlias will raise '354: object does
+    # not exist' if loadModel silently failed (this happens when the
+    # scene state is inconsistent, e.g. left over from a crashed run).
+    try:
+        sim.getObjectAlias(h)
+    except Exception:
+        raise RuntimeError(
+            f"loadModel returned a stale handle for '{model_path}'. "
+            "Close CoppeliaSim entirely and reopen with a fresh scene "
+            "(File -> New scene), then re-run scene\\build_scene.py."
         )
     sim.setObjectAlias(h, alias)
     # Place above the floor so the model settles cleanly.
     sim.setObjectPosition(h, -1, [x, y, 0.13])
     sim.setObjectOrientation(h, -1, [0.0, 0.0, theta])
-    log.info("Loaded Pioneer P3DX as /%s at (%.2f, %.2f)", alias, x, y)
+    # Disable the stock Pioneer child Lua script -- otherwise its
+    # default obstacle-avoidance demo would compete with the bridge's
+    # wheel commands and the robot would wander on its own.
+    try:
+        props = sim.getModelProperty(h)
+        sim.setModelProperty(h, props | sim.modelproperty_scripts_inactive)
+    except Exception as e:
+        log.warning("Could not disable stock scripts on /%s: %s", alias, e)
+    log.info("Loaded Pioneer P3DX as /%s at (%.2f, %.2f) -- scripts disabled",
+             alias, x, y)
     return h
 
 
