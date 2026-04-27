@@ -1,0 +1,3 @@
+redis>=5.0
+coppeliasim-zmqremoteapi-client>=2.0.0
+PyYAML>=6.0

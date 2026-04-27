@@ -1,0 +1,9 @@
+# Optional: spin up a local Redis instance for the DALI2 LINDA channel.
+# Use `docker compose up -d redis` to start it in the background.
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: dali2-redis
+    ports:
+      - "6379:6379"
+    restart: unless-stopped
