@@ -45,6 +45,7 @@ believes(rescuer_pool([rescuer_1, rescuer_2, rescuer_3])).
 
 %% --- Told rules: priority queue ---
 %% Critical events outrank routine telemetry.
+%% source_agent, event, priority
 told(_, victim_seen(_,_,_,_),     200) :- true.
 told(_, victim_rescued(_),        180) :- true.
 told(_, propose(_),               150) :- true.
