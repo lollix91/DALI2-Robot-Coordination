@@ -37,15 +37,26 @@ created by `scene/build_scene.py` (or equivalent).
 from __future__ import annotations
 
 import argparse
+import base64
+import io
+import json
 import logging
 import math
+import os
+import queue
 import re
+import struct
 import threading
 import time
 from dataclasses import dataclass, field
 from typing import Optional
 
 import redis
+
+try:
+    from PIL import Image
+except ImportError:
+    Image = None  # graceful degradation -- screenshots disabled
 
 try:
     from coppeliasim_zmqremoteapi_client import RemoteAPIClient
@@ -74,12 +85,12 @@ DEFAULT_VICTIMS = [
 DEPOT_XY    = (0.0,  4.7)
 CHARGER_XY  = (-4.7, -4.7)
 
-DETECTION_RADIUS = 8.0      # m -- victim sensing (covers full 10x10 arena;
-                            #   models a "satellite reconnaissance" feed,
-                            #   set lower to require physical exploration)
+DETECTION_RADIUS = 3.0      # m -- victim sensing radius; robots must
+                            #   physically explore to discover victims
 ARRIVAL_RADIUS   = 0.40     # m -- consider target reached
-WHEEL_BASE       = 0.331    # m -- Pioneer P3DX
-WHEEL_RADIUS     = 0.0975   # m -- Pioneer P3DX
+ROBOT_Z          = 0.13     # m -- fixed height (kinematic, no gravity)
+HEADING_OFFSET   = math.pi  # Pioneer model's visual front is -X; add pi so
+                            #   the body visually faces the direction of travel
 MAX_LIN_VEL      = 0.45     # m/s
 MAX_ANG_VEL      = 1.40     # rad/s
 K_RHO            = 1.5
@@ -88,6 +99,15 @@ K_ALPHA          = 4.0
 BATTERY_DRAIN_MOVING = 0.5  # %/s
 BATTERY_DRAIN_IDLE   = 0.05 # %/s
 BATTERY_CHARGE_RATE  = 5.0  # %/s while at charger
+
+SCREENSHOT_INTERVAL  = 5.0  # seconds between screenshots per robot
+SCREENSHOT_BASE_DIR  = "screenshots"
+
+# Vision LLM settings (JAN local server or any OpenAI-compatible API)
+VISION_LLM_ENDPOINT = os.environ.get(
+    "VISION_LLM_ENDPOINT", "http://localhost:1337/v1/chat/completions")
+VISION_LLM_MODEL = os.environ.get("VISION_LLM_MODEL", "Qwen3_5-9B-IQ4_XS")
+VISION_LLM_ENABLED = os.environ.get("VISION_LLM_ENABLED", "true").lower() in ("1", "true", "yes")
 
 LOG_FORMAT = "[%(asctime)s] [%(levelname)s] [bridge] %(message)s"
 logging.basicConfig(level=logging.INFO, format=LOG_FORMAT, datefmt="%H:%M:%S")
@@ -102,14 +122,20 @@ log = logging.getLogger("bridge")
 class RobotState:
     name: str
     body_handle: int
-    left_motor: int
-    right_motor: int
+    left_motor: Optional[int] = None
+    right_motor: Optional[int] = None
     target_xy: Optional[tuple[float, float]] = None
     arrived_published: bool = True
     carrying: Optional[str] = None
     battery: float = 100.0
     moving: bool = False
     seen_victims: set[str] = field(default_factory=set)
+    camera_handle: Optional[int] = None
+    last_screenshot: float = 0.0
+    screenshot_count: int = 0
+    last_pos_publish: float = 0.0
+    last_bat_publish: float = 0.0
+    waiting_for_vision: bool = False
 
 
 @dataclass
@@ -165,6 +191,7 @@ class CoppeliaBridge:
 
         self._stop = threading.Event()
         self._sub_thread: Optional[threading.Thread] = None
+        self._cmd_queue: queue.Queue = queue.Queue()
 
     # ----------------------------------------------------------------------
     # Setup
@@ -175,16 +202,22 @@ class CoppeliaBridge:
         for name in ROBOT_NAMES:
             try:
                 body = self.sim.getObject(f"/{name}")
-                left = self.sim.getObject(f"/{name}/leftMotor")
-                right = self.sim.getObject(f"/{name}/rightMotor")
             except Exception as e:
                 raise RuntimeError(
-                    f"Object '/{name}' (with leftMotor/rightMotor children) not "
-                    f"found in the scene -- did you run scene/build_scene.py? "
-                    f"Underlying error: {e}"
+                    f"Object '/{name}' not found in the scene -- "
+                    f"did you run scene/build_scene.py?  Error: {e}"
                 )
-            self.robots[name] = RobotState(name=name, body_handle=body,
-                                           left_motor=left, right_motor=right)
+            self.robots[name] = RobotState(name=name, body_handle=body)
+            # Resolve vision sensor (camera)
+            try:
+                cam = self.sim.getObject(f"/{name}_camera")
+                self.robots[name].camera_handle = cam
+                log.info("Robot %s camera ready (handle=%d)", name, cam)
+            except Exception:
+                log.warning("No vision sensor found for %s -- screenshots disabled", name)
+            # Create screenshot directory
+            sdir = os.path.join(SCREENSHOT_BASE_DIR, name)
+            os.makedirs(sdir, exist_ok=True)
             log.info("Robot %s ready (handle=%d)", name, body)
 
         for vid, _, _, weight in self.victims_cfg:
@@ -225,11 +258,7 @@ class CoppeliaBridge:
             to, content, frm = parsed
             if to != self.SIM_AGENT or frm == self.SIM_AGENT:
                 continue
-            try:
-                self._handle_command(content, frm)
-            except Exception as e:
-                log.exception("Error handling command from %s: %s -- %s",
-                              frm, content, e)
+            self._cmd_queue.put((content, frm))
 
     # ----------------------------------------------------------------------
     # Command dispatch (DALI2 -> CoppeliaSim)
@@ -337,9 +366,19 @@ class CoppeliaBridge:
     # ----------------------------------------------------------------------
 
     def control_tick(self) -> None:
+        # Process queued commands from subscription thread (thread-safe).
+        while not self._cmd_queue.empty():
+            try:
+                content, frm = self._cmd_queue.get_nowait()
+                self._handle_command(content, frm)
+            except queue.Empty:
+                break
+            except Exception as e:
+                log.exception("Error handling command: %s", e)
         for st in self.robots.values():
             self._control_robot(st)
             self._sense_robot(st)
+            self._capture_screenshot(st)
 
     def _control_robot(self, st: RobotState) -> None:
         try:
@@ -347,7 +386,8 @@ class CoppeliaBridge:
             ori = self.sim.getObjectOrientation(st.body_handle, -1)
         except Exception:
             return
-        x, y, theta = pos[0], pos[1], ori[2]
+        x, y = pos[0], pos[1]
+        theta = self._wrap_angle(ori[2] - HEADING_OFFSET)
 
         # Battery dynamics --------------------------------------------------
         if st.target_xy is not None:
@@ -359,8 +399,10 @@ class CoppeliaBridge:
                 math.hypot(x - self.charger_xy[0], y - self.charger_xy[1]) < 0.6):
             st.battery = min(100.0, st.battery + BATTERY_CHARGE_RATE * self.dt)
 
-        # Go-to-goal control -----------------------------------------------
-        v_l = v_r = 0.0
+        # Go-to-goal control (kinematic) ------------------------------------
+        if st.waiting_for_vision:
+            st.moving = False
+            return
         if st.target_xy is not None:
             tx, ty = st.target_xy
             dx, dy = tx - x, ty - y
@@ -369,28 +411,34 @@ class CoppeliaBridge:
                 if not st.arrived_published:
                     st.arrived_published = True
                     st.target_xy = None
-                    self._set_wheels(st, 0.0, 0.0)
                     self.publish(st.name, "at_target")
                     log.info("%s reached target", st.name)
                 return
             target_th = math.atan2(dy, dx)
             alpha = self._wrap_angle(target_th - theta)
-            v = max(-MAX_LIN_VEL, min(MAX_LIN_VEL, K_RHO * rho * math.cos(alpha)))
+            v = min(MAX_LIN_VEL, K_RHO * rho)
             w = max(-MAX_ANG_VEL, min(MAX_ANG_VEL, K_ALPHA * alpha))
             # Slow down when not aligned
             if abs(alpha) > 0.6:
                 v *= 0.3
-            v_r = (2 * v + w * WHEEL_BASE) / (2 * WHEEL_RADIUS)
-            v_l = (2 * v - w * WHEEL_BASE) / (2 * WHEEL_RADIUS)
-        self._set_wheels(st, v_l, v_r)
+            # Integrate unicycle model
+            new_theta = theta + w * self.dt
+            new_x = x + v * math.cos(new_theta) * self.dt
+            new_y = y + v * math.sin(new_theta) * self.dt
+            try:
+                self.sim.setObjectPosition(
+                    st.body_handle, -1, [new_x, new_y, ROBOT_Z])
+                self.sim.setObjectOrientation(
+                    st.body_handle, -1,
+                    [0.0, 0.0, new_theta + HEADING_OFFSET])
+            except Exception as e:
+                log.debug("setObjectPosition failed for %s: %s", st.name, e)
+            if not getattr(st, '_ctrl_logged', False):
+                log.info("%s kinematic: pos=(%.2f,%.2f) th=%.2f "
+                         "target=(%.2f,%.2f) alpha=%.2f v=%.2f w=%.2f",
+                         st.name, x, y, theta, tx, ty, alpha, v, w)
+                st._ctrl_logged = True
         st.moving = (st.target_xy is not None)
-
-    def _set_wheels(self, st: RobotState, v_l: float, v_r: float) -> None:
-        try:
-            self.sim.setJointTargetVelocity(st.left_motor, v_l)
-            self.sim.setJointTargetVelocity(st.right_motor, v_r)
-        except Exception:
-            pass
 
     def _sense_robot(self, st: RobotState) -> None:
         try:
@@ -398,11 +446,17 @@ class CoppeliaBridge:
             ori = self.sim.getObjectOrientation(st.body_handle, -1)
         except Exception:
             return
-        x, y, theta = pos[0], pos[1], ori[2]
+        x, y = pos[0], pos[1]
+        theta = self._wrap_angle(ori[2] - HEADING_OFFSET)
 
-        # Periodic position + battery telemetry (every tick).
-        self.publish(st.name, f"position({x:.3f},{y:.3f},{theta:.3f})")
-        self.publish(st.name, f"battery({st.battery:.0f})")
+        # Throttled position + battery telemetry.
+        now = time.time()
+        if now - st.last_pos_publish >= 1.0:
+            st.last_pos_publish = now
+            self.publish(st.name, f"position({x:.3f},{y:.3f},{theta:.3f})")
+        if now - st.last_bat_publish >= 5.0:
+            st.last_bat_publish = now
+            self.publish(st.name, f"battery({st.battery:.0f})")
 
         # Victim detection: announce a victim once when first seen.
         for vs in self.victims.values():
@@ -420,6 +474,121 @@ class CoppeliaBridge:
                              f"{vp[1]:.3f},{vs.weight})")
                 log.info("%s detected %s @ (%.2f,%.2f) [%s]",
                          st.name, vs.vid, vp[0], vp[1], vs.weight)
+
+    # ------------------------------------------------------------------
+    # Vision: screenshot capture + LLM analysis
+    # ------------------------------------------------------------------
+
+    def _capture_screenshot(self, st: RobotState) -> None:
+        """Capture an image from the robot's vision sensor and save it."""
+        if st.camera_handle is None or Image is None:
+            return
+        now = time.time()
+        if now - st.last_screenshot < SCREENSHOT_INTERVAL:
+            return
+        st.last_screenshot = now
+        try:
+            img_raw, res = self.sim.getVisionSensorImg(st.camera_handle)
+            if not img_raw or not res or res[0] <= 0:
+                return
+            w, h = res[0], res[1]
+            # CoppeliaSim returns raw RGB bytes (bottom-up)
+            if isinstance(img_raw, bytes):
+                raw_bytes = img_raw
+            else:
+                raw_bytes = bytes(img_raw)
+            img = Image.frombytes("RGB", (w, h), raw_bytes)
+            img = img.transpose(Image.FLIP_TOP_BOTTOM)  # CoppeliaSim is bottom-up
+        except Exception as e:
+            log.debug("Screenshot failed for %s: %s", st.name, e)
+            return
+
+        st.screenshot_count += 1
+        fname = f"image{st.screenshot_count}.jpg"
+        fpath = os.path.join(SCREENSHOT_BASE_DIR, st.name, fname)
+        try:
+            img.save(fpath, "JPEG", quality=85)
+        except Exception as e:
+            log.warning("Failed to save screenshot %s: %s", fpath, e)
+            return
+        abs_path = os.path.abspath(fpath).replace("\\", "/")
+        log.info("Screenshot %s: %s", st.name, fname)
+        # Notify the agent via LINDA (use forward slashes -- Prolog chokes on \)
+        self.publish(st.name, f"screenshot('{abs_path}')")
+        # Analyse via vision LLM in background thread; robot pauses until done.
+        if VISION_LLM_ENABLED:
+            st.waiting_for_vision = True
+            threading.Thread(
+                target=self._analyse_screenshot,
+                args=(st.name, abs_path, img),
+                daemon=True
+            ).start()
+
+    def _analyse_screenshot(self, robot_name: str, image_path: str,
+                            img: "Image.Image") -> None:
+        """Send a screenshot to the vision LLM and publish the result."""
+        try:
+            import urllib.request
+            # Encode image as base64 JPEG
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=85)
+            b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+
+            prompt = (
+                "You are a rescue drone camera. Describe what you see in this image "
+                "from a search-and-rescue robot's point of view. "
+                "Focus on: Are there any victims (red cubes of different sizes)? "
+                "Any obstacles (brown/grey blocks)? "
+                "Is the path clear? Is there a depot (blue cylinder) or "
+                "charger (yellow cylinder)? "
+                "Reply with a short factual description (max 2 sentences)."
+            )
+
+            body = {
+                "model": VISION_LLM_MODEL or "gpt-4o-mini",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": prompt},
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:image/jpeg;base64,{b64}"
+                                }
+                            }
+                        ]
+                    }
+                ],
+                "max_tokens": 150,
+                "temperature": 0.3
+            }
+            data = json.dumps(body).encode("utf-8")
+            req = urllib.request.Request(
+                VISION_LLM_ENDPOINT,
+                data=data,
+                headers={"Content-Type": "application/json"},
+                method="POST"
+            )
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                result = json.loads(resp.read().decode("utf-8"))
+            content = result["choices"][0]["message"]["content"]
+            # Sanitise for Prolog (escape quotes, limit length)
+            content = content.replace("'", "\''").replace('"', '').strip()
+            if len(content) > 300:
+                content = content[:297] + "..."
+            log.info("Vision LLM [%s]: %s", robot_name, content)
+            # Publish analysis result to the agent
+            safe_content = content.replace(",", " ").replace("(", "").replace(")", "")
+            self.publish(robot_name,
+                         f"vision_analysis('{safe_content}')")
+        except Exception as e:
+            log.warning("Vision LLM analysis failed for %s: %s", robot_name, e)
+        finally:
+            # Un-gate movement regardless of success/failure.
+            rs = self.robots.get(robot_name)
+            if rs:
+                rs.waiting_for_vision = False
 
     @staticmethod
     def _wrap_angle(a: float) -> float:

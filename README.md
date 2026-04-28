@@ -6,9 +6,9 @@ bring them to a safe zone. Their **brains** are
 programming, SWI-Prolog). Their **bodies** live inside CoppeliaSim
 Edu. A small Python program glues the two together.
 
-> **You will run 4 things in parallel:** Redis, CoppeliaSim, the DALI2
-> server, and the Python bridge. Don't worry, every step has its own
-> terminal and a copy-paste command below.
+> **Quick start:** open CoppeliaSim with a new scene, then run
+> `python launch.py` — it starts Redis, builds the scene, launches
+> DALI2 and the bridge in one shot.  See section 3 for details.
 
 ---
 
@@ -17,15 +17,22 @@ Edu. A small Python program glues the two together.
 After everything is started:
 
 1. In **CoppeliaSim** three Pioneer P3DX robots start driving around
-   the arena.
-2. When one of them gets close enough to a coloured cube (a
-   "victim"), it tells the **coordinator** agent.
-3. The coordinator runs a quick auction: the closest available robot
-   wins green ("light") victims; the two closest robots cooperate to
-   pick up red ("heavy") victims.
-4. Robots drive their victim to the **blue depot**. When they arrive,
+   an arena with **obstacles** (rocks, crates, debris) and coloured
+   cubes representing victims.
+2. Each robot has an on-board **vision sensor** (camera). Every few
+   seconds the bridge captures a screenshot, saves it to
+   `screenshots/<robot_name>/`, and sends the image to a **vision
+   LLM** (GPT4All local server or any OpenAI-compatible API) for
+   analysis.
+3. The LLM describes what it sees; if a victim is detected (green
+   cube = light, red cube = heavy), the information is forwarded to
+   the **coordinator** agent.
+4. The coordinator runs a quick auction: the closest available robot
+   wins light victims; the two closest robots cooperate to pick up
+   heavy victims.
+5. Robots drive their victim to the **blue depot**. When they arrive,
    the box turns into a delivered task.
-5. If a robot's battery drops below 25%, it heads to the
+6. If a robot's battery drops below 25%, it heads to the
    **yellow charger** and is excluded from the next auction.
 
 You can watch the agents' beliefs, past events and live logs in your
@@ -60,121 +67,68 @@ python -m pip install -r bridge\requirements.txt
 
 ---
 
-## 3. Run the demo, step by step
+## 3. Run the demo
 
-You'll need **four terminals**. Open them all up front, in this order.
-The instructions below assume your repos live at `D:\Repository\` (as
-they currently do); change the paths if yours differ.
+### Option A — Single command (recommended)
 
-### Terminal 1 — Redis
+1. Open **CoppeliaSim Edu** → **File → New Scene**.
+2. In a single terminal:
 
-Run **once**, then leave it alone.
+```powershell
+cd D:\Repository\DALI2-Robot-Coordination
+python launch.py
+```
+
+This starts Redis, builds the scene (with obstacles + vision sensors),
+launches DALI2, and starts the bridge — all in one go.  Press
+`Ctrl+C` to stop everything.
+
+Useful flags:
+
+```powershell
+python launch.py --skip-redis          # Redis already running
+python launch.py --skip-scene          # scene already built
+python launch.py --config scene\scenario.yaml
+python launch.py --pioneer-model "C:\Program Files\CoppeliaRobotics\CoppeliaSimEdu\models\robots\mobile\pioneer p3dx.ttm"
+```
+
+### Option B — Step by step (four terminals)
+
+<details>
+<summary>Click to expand</summary>
+
+#### Terminal 1 — Redis
 
 ```powershell
 docker run -d --name dali2-redis -p 6379:6379 redis:7-alpine
 ```
 
-(If you already started it once, next time just do
-`docker start dali2-redis`.)
+(If already started once: `docker start dali2-redis`.)
 
-No Docker? Download `redis-server.exe` (e.g. from
-<https://github.com/microsoftarchive/redis/releases>) and run
-`redis-server.exe` in this terminal — it must stay open.
+#### Terminal 2 — CoppeliaSim
 
-> ✅ **Verify:** `docker ps` shows `dali2-redis` running on port `6379`.
+1. Launch CoppeliaSim Edu → File → New Scene.
+2. Don't press Play.
 
-### Terminal 2 — CoppeliaSim
-
-1. Launch **CoppeliaSim Edu** (Start menu, or
-   `C:\Program Files\CoppeliaRobotics\CoppeliaSimEdu\coppeliaSim.exe`).
-2. **File → New Scene** so you start from an empty arena.
-3. Leave the simulator open. Don't press Play yet — the scene builder
-   in the next step will populate the empty scene.
-
-> ✅ **Verify:** the CoppeliaSim window is open with an empty floor and
-> the toolbar shows ▶ Stop (i.e. the simulation is **not** running).
-
-### Terminal 3 — Build the scene
-
-This Python script connects to the running CoppeliaSim from outside
-and adds three Pioneer P3DX robots, five victim cubes, the depot and
-the charger.
+#### Terminal 3 — Build scene + start DALI2
 
 ```powershell
 cd D:\Repository\DALI2-Robot-Coordination
 python scene\build_scene.py
-```
-
-You should see log lines like:
-
-```
-[scene] Loaded Pioneer P3DX as /rescuer_1 at (-1.50, -2.50)
-[scene] Loaded Pioneer P3DX as /rescuer_2 at  (0.00, -2.50)
-[scene] Loaded Pioneer P3DX as /rescuer_3 at  (1.50, -2.50)
-[scene] Placed victim /victim_1 (light) at (4.00, 3.00)
-...
-[scene] Scene built. ...
-```
-
-> ✅ **Verify:** the CoppeliaSim window now shows three robots, five
-> coloured cubes, a blue disc (depot) and a yellow disc (charger).
-
-If you get a "Pioneer model not found" error, run:
-
-```powershell
-python scene\build_scene.py --pioneer-model "C:\Program Files\CoppeliaRobotics\CoppeliaSimEdu\models\robots\mobile\pioneer p3dx.ttm"
-```
-
-### Terminal 4 — DALI2 agents
-
-Start the DALI2 server, telling it to load `agents\rescue.pl`:
-
-```powershell
-cd D:\Repository\DALI2-Robot-Coordination
 swipl -l ..\DALI2\src\server.pl -g main -- 8080 agents\rescue.pl
 ```
 
-You should see:
-
-```
-=== DALI2 Multi-Agent System ===
-Node: node-8080 | Port: 8080
-Loading agents from: agents\rescue.pl
-Agents defined: [coordinator,rescuer_1,rescuer_2,rescuer_3,monitor]
-Server started, launching agent processes...
-```
-
-> ✅ **Verify:** open <http://localhost:8080> in your browser. You
-> should see five agents listed.
-
-### Terminal 5 — The bridge
-
-Open a **fifth** terminal and start the bridge. It will:
-
-- subscribe to Redis for messages addressed to the (virtual) agent `sim`,
-- start the CoppeliaSim simulation if it is stopped,
-- drive the robots and stream their sensors back to the agents.
+#### Terminal 4 — Bridge
 
 ```powershell
 cd D:\Repository\DALI2-Robot-Coordination
 python bridge\coppelia_bridge.py
 ```
 
-You should see:
+</details>
 
-```
-[bridge] Robot rescuer_1 ready (handle=...)
-[bridge] Robot rescuer_2 ready (handle=...)
-[bridge] Robot rescuer_3 ready (handle=...)
-[bridge] Victim victim_1 (light) ready (handle=...)
-...
-[bridge] Subscribed to LINDA channel
-[bridge] Simulation started
-[bridge] Bridge running -- ctrl+C to stop
-```
-
-> ✅ **Verify:** in CoppeliaSim the simulation is now playing (▶ icon
-> changed to ⏸), and the three robots start driving.
+> ✅ **Verify:** open <http://localhost:8080> — five agents listed;
+> in CoppeliaSim the robots are driving around obstacles and victims.
 
 ---
 
@@ -199,10 +153,12 @@ Web UI at <http://localhost:8080>:
 
 ## 5. Stopping everything
 
-In reverse order is cleanest:
+If you used `launch.py`: just press `Ctrl+C` — it stops everything.
 
-1. `Ctrl+C` in Terminal 5 (bridge).
-2. `Ctrl+C` in Terminal 4 (DALI2).
+If you used separate terminals, stop in reverse order:
+
+1. `Ctrl+C` in bridge terminal.
+2. `Ctrl+C` in DALI2 terminal.
 3. Stop the simulation in CoppeliaSim (⏹), then close the window.
 4. `docker stop dali2-redis` (or just close the Redis terminal).
 
@@ -230,21 +186,44 @@ python bridge\coppelia_bridge.py   --config scene\scenario.yaml
 
 ---
 
-## 7. Optional: LLM-driven triage
+## 7. Vision system
 
-DALI2 ships with an **AI Oracle** that can call any LLM through
-[OpenRouter](https://openrouter.ai). When a key is set, the
-coordinator's `victim_seenE` rule asks the model for a triage
-suggestion (advice only — the deterministic auction still decides who
-goes where):
+Each robot has a **CoppeliaSim vision sensor** (camera) mounted on
+top. The bridge captures screenshots every 5 seconds and saves them to
+`screenshots/<robot>/imageN.jpg`.
+
+The screenshot is sent as an event to the DALI2 agent (`screenshotE`)
+and, if a vision LLM is reachable, the image is also analysed
+automatically. The LLM responds with a Prolog fact like
+`victim_detected(light)` or `obstacle_ahead`, which the agent uses to
+inform the coordinator.
+
+### Local vision LLM (GPT4All)
+
+1. Install [GPT4All](https://gpt4all.io/) and enable the local
+   server (default: `http://localhost:4891`).
+2. Load a vision-capable model (e.g. LLaVA).
+3. The bridge and DALI2 will automatically use it.
+
+Environment variables for customisation:
+
+| Variable | Default | Description |
+|---|---|---|
+| `VISION_LLM_ENDPOINT` | `http://localhost:4891/v1/chat/completions` | OpenAI-compatible API |
+| `VISION_LLM_MODEL` | (empty — server picks) | Model name |
+| `VISION_LLM_ENABLED` | `true` | Set to `false` to disable |
+
+### Remote LLM (OpenRouter)
+
+DALI2 also ships with an **AI Oracle** for text-based triage via
+[OpenRouter](https://openrouter.ai):
 
 ```powershell
 $env:OPENROUTER_API_KEY = "sk-or-..."
-swipl -l ..\DALI2\src\server.pl -g main -- 8080 agents\rescue.pl
+python launch.py
 ```
 
-Without the key the system runs in pure-symbolic mode, which is the
-default.
+Without a key the system runs in pure-symbolic mode.
 
 ---
 
@@ -270,11 +249,13 @@ DALI2-Robot-Coordination\
 +- agents\
 |   `- rescue.pl              # All four DALI2 agents in one file
 +- bridge\
-|   +- coppelia_bridge.py     # Redis  <->  CoppeliaSim ZMQ
+|   +- coppelia_bridge.py     # Redis <-> CoppeliaSim ZMQ + vision
 |   `- requirements.txt
 +- scene\
-|   +- build_scene.py         # Programmatic scene setup
+|   +- build_scene.py         # Scene setup (robots, obstacles, victims)
 |   `- scenario.yaml          # Victim positions / weights
++- screenshots\               # Auto-created: per-robot camera images
++- launch.py                  # Single-command launcher
 +- docker-compose.yml         # Optional: `docker compose up -d`
 +- README.md                  # You are here
 ```
@@ -290,8 +271,12 @@ DALI2-Robot-Coordination\
    |                |                   |                  |                    | twin        |
    |  coordinator   |                   |  go-to-goal      |                    |             |
    |  rescuer_1..3  |                   |  battery model   |                    |  Pioneer +  |
-   |  monitor       |                   |  victim sensor   |                    |  victims    |
-   +----------------+                   +------------------+                    +-------------+
+   |  monitor       |                   |  victim sensor   |                    |  victims +  |
+   |                |                   |  vision capture  |                    |  obstacles  |
+   +----------------+                   +--   +-------+  -+                    +-------------+
+                                             | Vision |
+                                             | LLM    | (GPT4All / OpenAI-compatible)
+                                             +--------+
 ```
 
 The bridge registers itself as the (virtual) DALI2 agent named

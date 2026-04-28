@@ -58,17 +58,18 @@ told(_, position_update(_,_,_,_),  10) :- true.
 told(_, heartbeat(_),               5) :- true.
 
 %% --- Tell rules ---
-tell(_, _, propose(_))           :- true.
-tell(_, _, rescue_assignment(_,_,_)) :- true.
-tell(_, _, lift_now(_))          :- true.
-tell(_, _, log_event(_,_,_))     :- true.
+tell(_, _, propose(_))              :- true.
+tell(_, _, rescue_assignment(_,_,_,_)) :- true.
+tell(_, _, lift_now(_))             :- true.
+tell(_, _, log_event(_,_,_))        :- true.
+tell(_, _, request_bid(_,_,_,_))    :- true.
 
 %% --- Reactive rules ---
 
 %% A rescuer reports a sighting. We add it to the open task list (idempotent).
 victim_seenE(VictimId, X, Y, Weight) :>
     log("Sighting reported: ~w @(~2f,~2f) weight=~w", [VictimId, X, Y, Weight]),
-    ( has_past(known_victim(VictimId))
+    ( believes(known_victim(VictimId))
     ->  log("Already known: ~w", [VictimId])
     ;   assert_belief(known_victim(VictimId)),
         assert_belief(victim_info(VictimId, X, Y, Weight)),
@@ -94,8 +95,8 @@ ready_to_liftE(Robot, VictimId) :>
     log("Ready-to-lift: ~w on ~w", [Robot, VictimId]),
     assert_belief(ready_at(Robot, VictimId)),
     assert_belief(ready_at_t(Robot, VictimId)).
-%% past_event/2 below makes the timing constraint explicit (delta-t).
-past_event(ready_at_t(_,_), 5).
+%% Readiness is stored as a belief; sync_liftI checks both partners
+%% have the belief before issuing lift_now commands.
 
 %% A rescuer reports the victim was delivered.
 victim_rescuedE(VictimId) :>
@@ -150,7 +151,7 @@ internal_event(solicit_bids, 2, forever, true, forever).      %% allow re-solici
 
 %% Award task to lowest-cost bidder (light victim) or two lowest (heavy).
 award_taskI :>
-    has_past(soliciting(Vid)),
+    believes(soliciting(Vid)),
     \+ believes(assigned(Vid, _)),
     \+ believes(assigned_pair(Vid, _, _)),
     believes(victim_info(Vid, X, Y, Weight)),
@@ -191,14 +192,16 @@ helper(cleanup_bids(Vid)) :-
 %% explicit and inspectable in the past memory.
 sync_liftI :>
     believes(assigned_pair(Vid, R1, R2)),
-    has_past(ready_at_t(R1, Vid)),
-    has_past(ready_at_t(R2, Vid)),
+    believes(ready_at_t(R1, Vid)),
+    believes(ready_at_t(R2, Vid)),
     log("COOPERATIVE LIFT triggered for ~w by ~w + ~w", [Vid, R1, R2]),
     send(R1, lift_now(Vid)),
     send(R2, lift_now(Vid)),
     %% Drop confirmations so we don't re-fire.
     ( retract_belief(ready_at(R1, Vid)) ; true ),
     ( retract_belief(ready_at(R2, Vid)) ; true ),
+    ( retract_belief(ready_at_t(R1, Vid)) ; true ),
+    ( retract_belief(ready_at_t(R2, Vid)) ; true ),
     send(monitor, log_event(coop_lift, coordinator, [Vid, R1, R2])).
 internal_event(sync_lift, 0, forever, true, forever).
 
@@ -210,9 +213,8 @@ internal_event(sync_lift, 0, forever, true, forever).
           believes(unavailable(rescuer_3)) )
    ).
 
-%% Long lifetime so we don't re-process the same victim twice.
-past_event(known_victim(_),     forever).
-remember_event(known_victim(_), forever).
+%% Dedup: known_victim is stored as a belief (not an event), so the
+%% check in victim_seenE uses believes(known_victim(_)) to skip duplicates.
 
 
 %% =====================================================================
@@ -269,6 +271,20 @@ deliveredE(Id) :>
     assert_belief(state(idle)),
     send(coordinator, victim_rescued(Id)).
 
+%% --- Vision events (from bridge camera + LLM analysis) ---
+
+screenshotE(ImagePath) :>
+    believes(robot_id(Me)),
+    log("Screenshot captured: ~w", [ImagePath]),
+    assert_belief(last_screenshot(ImagePath)).
+    %% Vision analysis is handled by the bridge in a background thread;
+    %% the result arrives as a vision_analysis(Desc) event.
+
+vision_analysisE(Description) :>
+    believes(robot_id(Me)),
+    log("Bridge vision analysis: ~w", [Description]),
+    assert_belief(last_vision_analysis(Description)).
+
 %% --- Auction handling ---
 
 request_bidE(Vid, X, Y, _Weight) :>
@@ -321,7 +337,7 @@ helper(on_arrive) :-
     ; believes(target(Vid, _X, _Y, light))
     ->  %% Arrived at a light victim -- pick up immediately.
         send(sim, attach(Me, Vid)),
-        retractall(believes_dynamic(state(_))),
+        retract_belief(state(_)),
         assert_belief(state(carrying(Vid))),
         assert_belief(carrying(Vid)),
         send(sim, go_to_depot(Me))
@@ -360,6 +376,8 @@ told(_, at_target,                    50) :- true.
 told(_, obstacle_detected(_),         60) :- true.
 told(_, victim_in_range(_,_,_,_),    150) :- true.
 told(_, delivered(_),                170) :- true.
+told(_, screenshot(_),                30) :- true.
+told(_, vision_analysis(_),           80) :- true.
 
 tell(_, _, bid(_,_,_))            :- true.
 tell(_, _, ready_to_lift(_,_))    :- true.
@@ -372,6 +390,20 @@ tell(_, _, attach(_,_))           :- true.
 tell(_, _, release(_,_))          :- true.
 tell(_, _, go_to_depot(_))        :- true.
 tell(_, _, go_to_charger(_))      :- true.
+
+%% Helper: process vision LLM result and act on it
+helper(process_vision(victim_detected(Type))) :-
+    believes(robot_id(Me)),
+    believes(pose(X, Y, _)),
+    log("Vision detected ~w victim near (~2f,~2f)", [Type, X, Y]),
+    send(coordinator, victim_seen(vision_detect, X, Y, Type)).
+helper(process_vision(obstacle_ahead)) :-
+    believes(robot_id(Me)),
+    log("Vision: obstacle ahead -- slowing down").
+helper(process_vision(clear_path)) :-
+    log("Vision: path is clear").
+helper(process_vision(_Other)) :-
+    true.  %% Unknown result, ignore
 
 %% --------------------------- rescuer_2 -------------------------------
 :- agent(rescuer_2, [cycle(1)]).
@@ -400,6 +432,14 @@ deliveredE(Id) :>
     retract_belief(state(_)),
     assert_belief(state(idle)),
     send(coordinator, victim_rescued(Id)).
+screenshotE(ImagePath) :>
+    believes(robot_id(Me)),
+    log("Screenshot captured: ~w", [ImagePath]),
+    assert_belief(last_screenshot(ImagePath)).
+    %% Vision analysis is handled by the bridge in a background thread.
+vision_analysisE(Desc) :>
+    log("Bridge vision: ~w", [Desc]),
+    assert_belief(last_vision_analysis(Desc)).
 request_bidE(Vid, X, Y, _Weight) :>
     believes(robot_id(Me)), believes(battery_level(Bat)),
     ( believes(state(idle)), Bat >= 30 ->
@@ -455,6 +495,15 @@ told(_, at_target,                   50) :- true.
 told(_, obstacle_detected(_),        60) :- true.
 told(_, victim_in_range(_,_,_,_),   150) :- true.
 told(_, delivered(_),               170) :- true.
+told(_, screenshot(_),               30) :- true.
+told(_, vision_analysis(_),          80) :- true.
+
+helper(process_vision(victim_detected(Type))) :-
+    believes(robot_id(Me)), believes(pose(X, Y, _)),
+    send(coordinator, victim_seen(vision_detect, X, Y, Type)).
+helper(process_vision(obstacle_ahead)) :- true.
+helper(process_vision(clear_path)) :- true.
+helper(process_vision(_)) :- true.
 
 %% --------------------------- rescuer_3 -------------------------------
 :- agent(rescuer_3, [cycle(1)]).
@@ -483,6 +532,14 @@ deliveredE(Id) :>
     retract_belief(state(_)),
     assert_belief(state(idle)),
     send(coordinator, victim_rescued(Id)).
+screenshotE(ImagePath) :>
+    believes(robot_id(Me)),
+    log("Screenshot captured: ~w", [ImagePath]),
+    assert_belief(last_screenshot(ImagePath)).
+    %% Vision analysis is handled by the bridge in a background thread.
+vision_analysisE(Desc) :>
+    log("Bridge vision: ~w", [Desc]),
+    assert_belief(last_vision_analysis(Desc)).
 request_bidE(Vid, X, Y, _Weight) :>
     believes(robot_id(Me)), believes(battery_level(Bat)),
     ( believes(state(idle)), Bat >= 30 ->
@@ -538,6 +595,15 @@ told(_, at_target,                   50) :- true.
 told(_, obstacle_detected(_),        60) :- true.
 told(_, victim_in_range(_,_,_,_),   150) :- true.
 told(_, delivered(_),               170) :- true.
+told(_, screenshot(_),               30) :- true.
+told(_, vision_analysis(_),          80) :- true.
+
+helper(process_vision(victim_detected(Type))) :-
+    believes(robot_id(Me)), believes(pose(X, Y, _)),
+    send(coordinator, victim_seen(vision_detect, X, Y, Type)).
+helper(process_vision(obstacle_ahead)) :- true.
+helper(process_vision(clear_path)) :- true.
+helper(process_vision(_)) :- true.
 
 
 %% =====================================================================
@@ -554,4 +620,5 @@ summaryI :>
     log("Mission heartbeat -- monitor alive").
 internal_event(summary, 30, forever, true, forever).
 
-told(_, log_event(_,_,_), 50) :- true.
+told(_, log_event(_,_,_),      50) :- true.
+told(_, request_bid(_,_,_,_),   5) :- true.   %% accept broadcasts silently

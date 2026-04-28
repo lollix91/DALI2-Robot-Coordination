@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import math
 import os
 import sys
 from typing import Optional
@@ -59,6 +60,22 @@ DEFAULT_VICTIMS = [
 DEPOT_XY    = (0.0,  4.7)
 CHARGER_XY  = (-4.7, -4.7)
 
+# Obstacles (placed before victims to create a more realistic scene)
+DEFAULT_OBSTACLES = [
+    ("rock_1",  2.0,  1.0, 0.35, [0.45, 0.40, 0.35]),   # brown rock
+    ("rock_2", -1.5,  3.0, 0.40, [0.50, 0.45, 0.38]),   # brown rock
+    ("rock_3",  3.0, -1.5, 0.30, [0.55, 0.50, 0.42]),   # brown rock
+    ("crate_1",-3.0, -3.0, 0.50, [0.60, 0.55, 0.30]),   # wooden crate
+    ("crate_2", 1.0,  3.5, 0.45, [0.58, 0.52, 0.28]),   # wooden crate
+    ("barrel_1",4.0,  0.0, 0.35, [0.35, 0.35, 0.40]),   # metal barrel
+    ("debris_1",-4.0, 1.0, 0.25, [0.40, 0.38, 0.35]),   # debris
+    ("debris_2", 0.5, -2.0, 0.30, [0.42, 0.40, 0.37]),  # debris
+]
+
+# Vision sensor resolution
+VISION_RES_X = 256
+VISION_RES_Y = 256
+
 
 # --------------------------------------------------------------------------
 
@@ -76,6 +93,66 @@ def safe_remove(sim, alias: str) -> None:
             return
         except Exception:
             continue
+
+
+def _remove_model_scripts(sim, model_handle: int, alias: str) -> int:
+    """Remove every script from a loaded model.
+
+    CoppeliaSim's ``modelproperty_scripts_inactive`` flag does NOT always
+    prevent the stock Lua demo script from running; the Pioneer's default
+    obstacle-avoidance wander then competes with the bridge's motor
+    commands.  Belt-and-suspenders: walk the tree and rip out every script.
+    """
+    removed = 0
+    try:
+        tree = sim.getObjectsInTree(model_handle, sim.handle_all, 0)
+    except Exception:
+        tree = [model_handle]
+
+    # --- Method 1: sim.getScript with various type constants ----------------
+    stypes = {}
+    for attr in ('scripttype_childscript', 'scripttype_simulation',
+                 'scripttype_customizationscript', 'scripttype_customization'):
+        v = getattr(sim, attr, None)
+        if v is not None:
+            stypes[attr] = v
+    for obj_h in tree:
+        for attr, stype in stypes.items():
+            # Try (stype, objHandle) and (stype, objHandle, '')
+            for args in ((stype, obj_h), (stype, obj_h, '')):
+                try:
+                    sh = sim.getScript(*args)
+                    if sh is not None and sh >= 0:
+                        sim.removeScript(sh)
+                        removed += 1
+                        log.info("  Removed script (type=%s) from obj %d", attr, obj_h)
+                        break
+                except Exception:
+                    continue
+
+    # --- Method 2: look for script-type objects in the tree -----------------
+    # In CoppeliaSim V4.6+, scripts are scene objects with their own type id.
+    script_obj_type = getattr(sim, 'sceneobject_script', None)
+    if script_obj_type is not None:
+        try:
+            scripts = sim.getObjectsInTree(model_handle, script_obj_type, 0)
+            for sh in scripts:
+                try:
+                    sim.removeObject(sh)
+                    removed += 1
+                    log.info("  Removed script object %d", sh)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    if removed:
+        log.info("Removed %d script(s) from /%s", removed, alias)
+    else:
+        log.warning("Could not find/remove scripts from /%s -- "
+                    "if the robot wanders, try removing scripts manually "
+                    "in the CoppeliaSim GUI", alias)
+    return removed
 
 
 def load_pioneer(sim, model_path: str, alias: str,
@@ -101,30 +178,41 @@ def load_pioneer(sim, model_path: str, alias: str,
     sim.setObjectAlias(h, alias)
     # Place above the floor so the model settles cleanly.
     sim.setObjectPosition(h, -1, [x, y, 0.13])
-    sim.setObjectOrientation(h, -1, [0.0, 0.0, theta])
-    # Disable the stock Pioneer child Lua script -- otherwise its
-    # default obstacle-avoidance demo would compete with the bridge's
-    # wheel commands and the robot would wander on its own.
+    # The Pioneer model's visual front faces local -X.
+    # Add pi so the visual front aligns with the logical heading.
+    sim.setObjectOrientation(h, -1, [0.0, 0.0, theta + math.pi])
+    # Make the model fully non-dynamic (kinematic).  The bridge moves it
+    # directly via setObjectPosition / setObjectOrientation every tick,
+    # so we do NOT need the physics engine for the robot.  This also
+    # prevents it from falling off the floor under gravity.
     try:
         props = sim.getModelProperty(h)
-        sim.setModelProperty(h, props | sim.modelproperty_scripts_inactive)
+        sim.setModelProperty(
+            h,
+            props
+            | sim.modelproperty_not_dynamic
+            | sim.modelproperty_not_respondable
+            | sim.modelproperty_scripts_inactive,
+        )
     except Exception as e:
-        log.warning("Could not disable stock scripts on /%s: %s", alias, e)
-    log.info("Loaded Pioneer P3DX as /%s at (%.2f, %.2f) -- scripts disabled",
+        log.warning("Could not set model properties on /%s: %s", alias, e)
+    # Belt-and-suspenders: explicitly remove every script in the model.
+    _remove_model_scripts(sim, h, alias)
+    log.info("Loaded Pioneer P3DX as /%s at (%.2f, %.2f) -- kinematic mode",
              alias, x, y)
     return h
 
 
 def make_victim(sim, vid: str, x: float, y: float, weight: str) -> int:
     safe_remove(sim, vid)
-    # Light victims are short green cuboids; heavy victims are larger red.
+    # All victims are red cuboids; heavy ones are larger.
     if weight == "heavy":
         size = [0.45, 0.45, 0.45]
-        color = [0.85, 0.10, 0.10]
+        color = [0.90, 0.10, 0.10]
         z = 0.225
     else:
         size = [0.30, 0.30, 0.30]
-        color = [0.10, 0.75, 0.20]
+        color = [0.95, 0.20, 0.15]
         z = 0.150
     h = sim.createPrimitiveShape(sim.primitiveshape_cuboid, size, 0)
     sim.setObjectAlias(h, vid)
@@ -143,13 +231,92 @@ def make_victim(sim, vid: str, x: float, y: float, weight: str) -> int:
     return h
 
 
-def make_marker(sim, alias: str, x: float, y: float,
-                color: list[float], radius: float = 0.6) -> int:
+def make_obstacle(sim, alias: str, x: float, y: float,
+                  size: float, color: list[float]) -> int:
+    """Place a static obstacle (cuboid of random-ish proportions) in the scene."""
     safe_remove(sim, alias)
-    h = sim.createPrimitiveShape(sim.primitiveshape_disc,
-                                 [radius * 2, radius * 2, 0.005], 0)
+    # Vary shape slightly for visual interest
+    sx = size * 1.0
+    sy = size * 0.8
+    sz = size * 0.7
+    h = sim.createPrimitiveShape(sim.primitiveshape_cuboid, [sx, sy, sz], 0)
     sim.setObjectAlias(h, alias)
-    sim.setObjectPosition(h, -1, [x, y, 0.005])
+    sim.setObjectPosition(h, -1, [x, y, sz / 2.0])
+    try:
+        sim.setShapeColor(h, None, sim.colorcomponent_ambient_diffuse, color)
+    except Exception:
+        pass
+    try:
+        sim.setObjectInt32Param(h, sim.shapeintparam_static, 1)
+        sim.setObjectInt32Param(h, sim.shapeintparam_respondable, 1)
+    except Exception:
+        pass
+    log.info("Placed obstacle /%s at (%.2f, %.2f) size=%.2f", alias, x, y, size)
+    return h
+
+
+def add_vision_sensor(sim, robot_handle: int, alias: str) -> int:
+    """Add a forward-facing vision sensor to a robot.
+
+    The sensor is mounted on top of the robot, looking forward along
+    the robot's local X axis.
+    """
+    sensor_alias = f"{alias}_camera"
+    safe_remove(sim, sensor_alias)
+    # Create a vision sensor
+    options = 2  # bit1 = perspective projection
+    int_params = [
+        VISION_RES_X,  # resolution x
+        VISION_RES_Y,  # resolution y
+        0,             # reserved
+        0,             # reserved
+    ]
+    float_params = [
+        0.15,   # near clipping plane (skip robot body)
+        10.0,   # far clipping plane
+        60.0 * 3.14159 / 180.0,  # view angle (60 deg)
+        0.0,    # reserved
+        0.0,    # reserved
+        0.0,    # reserved
+        0.0, 0.0, 0.0, 0.0, 0.0,  # reserved
+    ]
+    h = sim.createVisionSensor(options, int_params, float_params)
+    sim.setObjectAlias(h, sensor_alias)
+    # Mount on top of robot, looking forward.
+    # We use setObjectMatrix (3x4 row-major) to avoid Euler-angle ambiguity.
+    #
+    # Vision sensors look along their local -Z.  The Pioneer model's
+    # visual forward is along its local -X.  We want:
+    #   camera -Z  ->  robot -X   (visual forward)
+    #   camera +Y  ->  robot +Z   (up / world up)
+    #   camera +X  ->  robot +Y   (right-hand rule)
+    #
+    # Rotation matrix (columns = where camera X,Y,Z land in robot frame):
+    #   R = [[ 0,  0,  1],
+    #        [ 1,  0,  0],
+    #        [ 0,  1,  0]]
+    # Position relative to robot: -30 cm in X (= visual front, past bumper),
+    # 25 cm above centre.
+    matrix = [
+         0,  0,  1, -0.30,   # row 0
+         1,  0,  0,  0.00,   # row 1
+         0,  1,  0,  0.25,   # row 2
+    ]
+    sim.setObjectParent(h, robot_handle, True)
+    sim.setObjectMatrix(h, robot_handle, matrix)
+    log.info("Added vision sensor /%s to /%s", sensor_alias, alias)
+    return h
+
+
+def make_marker(sim, alias: str, x: float, y: float,
+                color: list[float], radius: float = 0.4,
+                height: float = 0.35) -> int:
+    """Place a 3-D cylinder marker visible from ground-level cameras."""
+    safe_remove(sim, alias)
+    h = sim.createPrimitiveShape(sim.primitiveshape_cylinder,
+                                 [radius * 2, radius * 2, height], 0)
+    sim.setObjectAlias(h, alias)
+    sim.setObjectPosition(h, -1, [x, y, height / 2.0])
     try:
         sim.setShapeColor(h, None, sim.colorcomponent_ambient_diffuse, color)
     except Exception:
@@ -204,15 +371,20 @@ def main() -> None:
         except Exception:
             pass
 
-    # 1. Robots --------------------------------------------------------------
+    # 1. Robots + vision sensors -------------------------------------------
     for alias, x, y, theta in ROBOT_SPAWNS:
-        load_pioneer(sim, args.pioneer_model, alias, x, y, theta)
+        rh = load_pioneer(sim, args.pioneer_model, alias, x, y, theta)
+        add_vision_sensor(sim, rh, alias)
 
-    # 2. Victims -------------------------------------------------------------
+    # 2. Obstacles (placed before victims for realism) ----------------------
+    for alias, x, y, size, color in DEFAULT_OBSTACLES:
+        make_obstacle(sim, alias, x, y, size, color)
+
+    # 3. Victims -------------------------------------------------------------
     for vid, x, y, weight in load_victims_cfg(args.config):
         make_victim(sim, vid, x, y, weight)
 
-    # 3. Markers (depot, charger) -------------------------------------------
+    # 4. Markers (depot, charger) -------------------------------------------
     make_marker(sim, "depot",   DEPOT_XY[0],   DEPOT_XY[1],   [0.20, 0.40, 0.95])
     make_marker(sim, "charger", CHARGER_XY[0], CHARGER_XY[1], [0.95, 0.85, 0.10])
 
