@@ -9,6 +9,7 @@ Starts all four components in order:
 
 Usage:
     python launch.py [--skip-redis] [--skip-scene] [--config scene/scenario.yaml]
+    python launch.py --openrouter sk-or-v1-abc123...   # use OpenRouter gpt-4o
 
 Press Ctrl+C to stop everything.
 """
@@ -90,6 +91,9 @@ def main() -> None:
                    help="DALI2 HTTP server port (default: 8080)")
     p.add_argument("--agent-file", default="agents/rescue.pl",
                    help="Path to DALI2 agent file (default: agents/rescue.pl)")
+    p.add_argument("--openrouter", metavar="API_KEY", default=None,
+                   help="Use OpenRouter with gpt-4o for vision instead of "
+                        "local Jan. Pass your OpenRouter API key.")
     args = p.parse_args()
 
     procs: list[subprocess.Popen] = []
@@ -133,7 +137,21 @@ def main() -> None:
         bridge_cmd = [sys.executable, os.path.join(ROOT, "bridge", "coppelia_bridge.py")]
         if args.config:
             bridge_cmd += ["--config", args.config]
-        bridge_proc = subprocess.Popen(bridge_cmd, cwd=ROOT)
+
+        # Build environment for the bridge process
+        bridge_env = os.environ.copy()
+        if args.openrouter:
+            bridge_env["VISION_LLM_ENDPOINT"] = (
+                "https://openrouter.ai/api/v1/chat/completions"
+            )
+            bridge_env["VISION_LLM_MODEL"] = "openai/gpt-4o"
+            bridge_env["VISION_LLM_API_KEY"] = args.openrouter
+            bridge_env["VISION_LLM_TIMEOUT"] = "30"  # remote API, allow more time
+            print("[launch] VLM backend: OpenRouter (gpt-4o)")
+        else:
+            print("[launch] VLM backend: Jan local (Qwen3)")
+
+        bridge_proc = subprocess.Popen(bridge_cmd, cwd=ROOT, env=bridge_env)
         procs.append(bridge_proc)
         time.sleep(3)  # Give bridge time to connect and subscribe to LINDA
 

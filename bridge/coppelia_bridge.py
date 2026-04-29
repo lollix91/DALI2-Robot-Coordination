@@ -108,6 +108,8 @@ SCREENSHOT_BASE_DIR  = "screenshots"
 VISION_LLM_ENDPOINT = os.environ.get(
     "VISION_LLM_ENDPOINT", "http://localhost:1337/v1/chat/completions")
 VISION_LLM_MODEL = os.environ.get("VISION_LLM_MODEL", "Qwen3_5-9B-IQ4_XS")
+VISION_LLM_API_KEY = os.environ.get("VISION_LLM_API_KEY", "")
+VISION_LLM_TIMEOUT = int(os.environ.get("VISION_LLM_TIMEOUT", "15"))
 VISION_LLM_ENABLED = os.environ.get("VISION_LLM_ENABLED", "true").lower() in ("1", "true", "yes")
 
 LOG_FORMAT = "[%(asctime)s] [%(levelname)s] [bridge] %(message)s"
@@ -394,6 +396,8 @@ class CoppeliaBridge:
                 if ost.follow_leader == robot and ost.carrying == vid:
                     ost.follow_leader = None
                     ost.carrying = None
+                    ost.target_xy = None
+                    ost.arrived_published = True
                     self.publish(oname, f"delivered({vid})")
                     log.info("Notified follower %s of delivery of %s",
                              oname, vid)
@@ -806,19 +810,24 @@ class CoppeliaBridge:
                         ]
                     }
                 ],
-                "max_tokens": 100,
-                "temperature": 0.1
+                "max_tokens": 500,
+                "temperature": 0.7
             }
             data = json.dumps(body).encode("utf-8")
+            headers = {"Content-Type": "application/json"}
+            if VISION_LLM_API_KEY:
+                headers["Authorization"] = f"Bearer {VISION_LLM_API_KEY}"
             req = urllib.request.Request(
                 VISION_LLM_ENDPOINT,
                 data=data,
-                headers={"Content-Type": "application/json"},
+                headers=headers,
                 method="POST"
             )
-            with urllib.request.urlopen(req, timeout=10) as resp:
+            with urllib.request.urlopen(req, timeout=VISION_LLM_TIMEOUT) as resp:
                 result = json.loads(resp.read().decode("utf-8"))
             content = result["choices"][0]["message"]["content"].strip()
+            # Qwen3 models wrap reasoning in <think>...</think>; strip it.
+            content = re.sub(r"<think>[\s\S]*?</think>", "", content).strip()
             log.info("Vision LLM [%s]: %s", robot_name, content)
 
             # Parse structured result

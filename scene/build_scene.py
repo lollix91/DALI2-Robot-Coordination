@@ -70,8 +70,8 @@ DEFAULT_OBSTACLES = [
 ]
 
 # Vision sensor resolution
-VISION_RES_X = 512
-VISION_RES_Y = 512
+VISION_RES_X = 256
+VISION_RES_Y = 256
 
 
 # --------------------------------------------------------------------------
@@ -271,7 +271,7 @@ def add_vision_sensor(sim, robot_handle: int, alias: str) -> int:
     float_params = [
         0.15,   # near clipping plane (skip robot body)
         10.0,   # far clipping plane
-        60.0 * 3.14159 / 180.0,  # view angle (60 deg)
+        90.0 * 3.14159 / 180.0,  # view angle (90 deg – wider coverage)
         0.0,    # reserved
         0.0,    # reserved
         0.0,    # reserved

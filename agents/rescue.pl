@@ -223,12 +223,13 @@ victim_in_rangeE(Id, X, Y, Weight) :>
 
 deliveredE(Id) :>
     believes(robot_id(Me)),
-    log("Delivered ~w", [Id]),
+    log("Delivered ~w -- resuming patrol", [Id]),
     ( retract_belief(carrying(_)) ; true ),
     ( retract_belief(target(Id, _, _, _)) ; true ),
     ( retract_belief(state(_)) ; true ),
-    assert_belief(state(idle)),
-    send(coordinator, victim_rescued(Id)).
+    assert_belief(state(exploring)),
+    send(coordinator, victim_rescued(Id)),
+    send(sim, explore(Me)).
 
 %% --- Vision events (from bridge camera + LLM analysis) ---
 
@@ -403,12 +404,13 @@ victim_in_rangeE(Id, X, Y, Weight) :>
     send(coordinator, victim_seen(Id, X, Y, Weight)).
 deliveredE(Id) :>
     believes(robot_id(Me)),
-    log("Delivered ~w", [Id]),
+    log("Delivered ~w -- resuming patrol", [Id]),
     ( retract_belief(carrying(_)) ; true ),
     ( retract_belief(target(Id, _, _, _)) ; true ),
     ( retract_belief(state(_)) ; true ),
-    assert_belief(state(idle)),
-    send(coordinator, victim_rescued(Id)).
+    assert_belief(state(exploring)),
+    send(coordinator, victim_rescued(Id)),
+    send(sim, explore(Me)).
 screenshotE(ImagePath) :>
     believes(robot_id(Me)),
     log("Screenshot captured: ~w", [ImagePath]),
@@ -525,12 +527,13 @@ victim_in_rangeE(Id, X, Y, Weight) :>
     send(coordinator, victim_seen(Id, X, Y, Weight)).
 deliveredE(Id) :>
     believes(robot_id(Me)),
-    log("Delivered ~w", [Id]),
+    log("Delivered ~w -- resuming patrol", [Id]),
     ( retract_belief(carrying(_)) ; true ),
     ( retract_belief(target(Id, _, _, _)) ; true ),
     ( retract_belief(state(_)) ; true ),
-    assert_belief(state(idle)),
-    send(coordinator, victim_rescued(Id)).
+    assert_belief(state(exploring)),
+    send(coordinator, victim_rescued(Id)),
+    send(sim, explore(Me)).
 screenshotE(ImagePath) :>
     believes(robot_id(Me)),
     log("Screenshot captured: ~w", [ImagePath]),
