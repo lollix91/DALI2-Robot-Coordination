@@ -258,8 +258,8 @@ def make_obstacle(sim, alias: str, x: float, y: float,
 def add_vision_sensor(sim, robot_handle: int, alias: str) -> int:
     """Add a forward-facing vision sensor to a robot.
 
-    The sensor is mounted on top of the robot, looking forward along
-    the robot's local X axis.
+    The sensor is mounted on top of the robot, looking along the
+    robot's direction of travel (kinematic +X).
     """
     sensor_alias = f"{alias}_camera"
     safe_remove(sim, sensor_alias)
@@ -282,24 +282,26 @@ def add_vision_sensor(sim, robot_handle: int, alias: str) -> int:
     ]
     h = sim.createVisionSensor(options, int_params, float_params)
     sim.setObjectAlias(h, sensor_alias)
-    # Mount on top of robot, looking forward.
+    # Mount on top of robot, looking along the direction of travel.
     # We use setObjectMatrix (3x4 row-major) to avoid Euler-angle ambiguity.
     #
-    # Vision sensors look along their local -Z.  The Pioneer model's
-    # visual forward is along its local -X.  We want:
-    #   camera -Z  ->  robot -X   (visual forward)
+    # Vision sensors look along their local -Z.  The bridge's kinematic
+    # controller drives the robot along +X (with HEADING_OFFSET rotating
+    # the model so its visual front aligns with the heading).  We orient
+    # the camera so it captures what lies ahead in the travel direction:
+    #   camera -Z  ->  robot +X   (direction of travel)
     #   camera +Y  ->  robot +Z   (up / world up)
-    #   camera +X  ->  robot +Y   (right-hand rule)
+    #   camera +X  ->  robot -Y   (right-hand rule)
     #
     # Rotation matrix (columns = where camera X,Y,Z land in robot frame):
-    #   R = [[ 0,  0,  1],
-    #        [ 1,  0,  0],
+    #   R = [[ 0,  0, -1],
+    #        [-1,  0,  0],
     #        [ 0,  1,  0]]
-    # Position relative to robot: -30 cm in X (= visual front, past bumper),
-    # 25 cm above centre.
+    # Position relative to robot: +30 cm in X (forward in direction of
+    # travel), 25 cm above centre.
     matrix = [
-         0,  0,  1, -0.30,   # row 0
-         1,  0,  0,  0.00,   # row 1
+         0,  0, -1,  0.30,   # row 0
+        -1,  0,  0,  0.00,   # row 1
          0,  1,  0,  0.25,   # row 2
     ]
     sim.setObjectParent(h, robot_handle, True)

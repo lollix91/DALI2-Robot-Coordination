@@ -44,6 +44,7 @@ import logging
 import math
 import os
 import queue
+import random
 import re
 import struct
 import threading
@@ -98,6 +99,10 @@ K_ALPHA          = 4.0
 
 BATTERY_DRAIN_MOVING = 0.5  # %/s
 BATTERY_DRAIN_IDLE   = 0.05 # %/s
+
+# Arena bounds for exploration waypoints (metres)
+ARENA_BOUNDS = (-4.5, 4.5, -4.5, 4.5)  # min_x, max_x, min_y, max_y
+EXPLORE_STEP = 2.0                      # grid spacing for patrol waypoints
 BATTERY_CHARGE_RATE  = 5.0  # %/s while at charger
 
 SCREENSHOT_INTERVAL  = 5.0  # seconds between screenshots per robot
@@ -136,6 +141,9 @@ class RobotState:
     last_pos_publish: float = 0.0
     last_bat_publish: float = 0.0
     waiting_for_vision: bool = False
+    exploring: bool = False
+    explore_waypoints: list = field(default_factory=list)
+    explore_index: int = 0
 
 
 @dataclass
@@ -292,6 +300,7 @@ class CoppeliaBridge:
             return
         st.target_xy = (x, y)
         st.arrived_published = False
+        st.exploring = False
         log.info("Target for %s -> (%.2f, %.2f)", robot, x, y)
 
     def _cmd_go_to_depot(self, args, sender):
@@ -301,6 +310,7 @@ class CoppeliaBridge:
             return
         st.target_xy = self.depot_xy
         st.arrived_published = False
+        st.exploring = False
 
     def _cmd_go_to_charger(self, args, sender):
         robot = args[0]
@@ -309,6 +319,7 @@ class CoppeliaBridge:
             return
         st.target_xy = self.charger_xy
         st.arrived_published = False
+        st.exploring = False
 
     def _cmd_attach(self, args, sender):
         # attach(rescuer_i, victim_id)
@@ -362,6 +373,67 @@ class CoppeliaBridge:
             log.info("Released %s at non-depot location (d=%.2f)", vid, d)
 
     # ----------------------------------------------------------------------
+    # Exploration commands
+    # ----------------------------------------------------------------------
+
+    def _cmd_explore(self, args, sender):
+        """Pick the next patrol waypoint and drive there."""
+        robot = args[0]
+        st = self.robots.get(robot)
+        if st is None:
+            return
+        if not st.explore_waypoints:
+            st.explore_waypoints = self._generate_waypoints()
+        if st.explore_index >= len(st.explore_waypoints):
+            random.shuffle(st.explore_waypoints)
+            st.explore_index = 0
+        wp = st.explore_waypoints[st.explore_index]
+        st.explore_index += 1
+        st.target_xy = wp
+        st.arrived_published = False
+        st.exploring = True
+        log.info("Explore %s -> waypoint (%.2f, %.2f)", robot, wp[0], wp[1])
+
+    def _cmd_avoid_obstacle(self, args, sender):
+        """Compute a waypoint perpendicular to current heading to skirt an obstacle."""
+        robot = args[0]
+        st = self.robots.get(robot)
+        if st is None:
+            return
+        try:
+            pos = self.sim.getObjectPosition(st.body_handle, -1)
+            ori = self.sim.getObjectOrientation(st.body_handle, -1)
+        except Exception:
+            return
+        theta = self._wrap_angle(ori[2] - HEADING_OFFSET)
+        # Step to the right (+90°) and slightly forward
+        avoid_angle = theta + math.pi / 2
+        dist = 2.0
+        ax = pos[0] + dist * math.cos(avoid_angle) + 1.0 * math.cos(theta)
+        ay = pos[1] + dist * math.sin(avoid_angle) + 1.0 * math.sin(theta)
+        min_x, max_x, min_y, max_y = ARENA_BOUNDS
+        ax = max(min_x, min(max_x, ax))
+        ay = max(min_y, min(max_y, ay))
+        st.target_xy = (ax, ay)
+        st.arrived_published = False
+        st.exploring = True   # treat as exploration continuation
+        log.info("Avoid obstacle %s -> (%.2f, %.2f)", robot, ax, ay)
+
+    def _generate_waypoints(self) -> list[tuple[float, float]]:
+        """Generate a shuffled grid of patrol waypoints covering the arena."""
+        min_x, max_x, min_y, max_y = ARENA_BOUNDS
+        waypoints: list[tuple[float, float]] = []
+        x = min_x
+        while x <= max_x:
+            y = min_y
+            while y <= max_y:
+                waypoints.append((x, y))
+                y += EXPLORE_STEP
+            x += EXPLORE_STEP
+        random.shuffle(waypoints)
+        return waypoints
+
+    # ----------------------------------------------------------------------
     # Control + sensing tick (CoppeliaSim -> DALI2)
     # ----------------------------------------------------------------------
 
@@ -410,9 +482,13 @@ class CoppeliaBridge:
             if rho < ARRIVAL_RADIUS:
                 if not st.arrived_published:
                     st.arrived_published = True
+                    was_exploring = st.exploring
+                    st.exploring = False
                     st.target_xy = None
                     self.publish(st.name, "at_target")
                     log.info("%s reached target", st.name)
+                    if was_exploring:
+                        st.last_screenshot = 0  # force immediate screenshot
                 return
             target_th = math.atan2(dy, dx)
             alpha = self._wrap_angle(target_th - theta)
@@ -526,7 +602,7 @@ class CoppeliaBridge:
 
     def _analyse_screenshot(self, robot_name: str, image_path: str,
                             img: "Image.Image") -> None:
-        """Send a screenshot to the vision LLM and publish the result."""
+        """Send a screenshot to the vision LLM and publish structured results."""
         try:
             import urllib.request
             # Encode image as base64 JPEG
@@ -535,13 +611,18 @@ class CoppeliaBridge:
             b64 = base64.b64encode(buf.getvalue()).decode("ascii")
 
             prompt = (
-                "You are a rescue drone camera. Describe what you see in this image "
-                "from a search-and-rescue robot's point of view. "
-                "Focus on: Are there any victims (red cubes of different sizes)? "
-                "Any obstacles (brown/grey blocks)? "
-                "Is the path clear? Is there a depot (blue cylinder) or "
-                "charger (yellow cylinder)? "
-                "Reply with a short factual description (max 2 sentences)."
+                "You are analysing an image from a search-and-rescue robot camera.\n"
+                "Answer ONLY with a JSON object in this exact format:\n"
+                '{"victim": false, "victim_type": null, "obstacle": false, '
+                '"path_clear": true}\n'
+                "Rules:\n"
+                "- victim: true if you see a red cube (a person to rescue)\n"
+                '- victim_type: "heavy" if the red cube is large, "light" if small, '
+                "null if no victim\n"
+                "- obstacle: true if there is a brown/grey block or rock directly "
+                "ahead blocking the path\n"
+                "- path_clear: true if the robot can keep moving forward safely\n"
+                "Reply with ONLY the JSON, no explanation."
             )
 
             body = {
@@ -560,8 +641,8 @@ class CoppeliaBridge:
                         ]
                     }
                 ],
-                "max_tokens": 150,
-                "temperature": 0.3
+                "max_tokens": 100,
+                "temperature": 0.1
             }
             data = json.dumps(body).encode("utf-8")
             req = urllib.request.Request(
@@ -572,23 +653,67 @@ class CoppeliaBridge:
             )
             with urllib.request.urlopen(req, timeout=30) as resp:
                 result = json.loads(resp.read().decode("utf-8"))
-            content = result["choices"][0]["message"]["content"]
-            # Sanitise for Prolog (escape quotes, limit length)
-            content = content.replace("'", "\''").replace('"', '').strip()
-            if len(content) > 300:
-                content = content[:297] + "..."
+            content = result["choices"][0]["message"]["content"].strip()
             log.info("Vision LLM [%s]: %s", robot_name, content)
-            # Publish analysis result to the agent
-            safe_content = content.replace(",", " ").replace("(", "").replace(")", "")
-            self.publish(robot_name,
-                         f"vision_analysis('{safe_content}')")
+
+            # Parse structured result
+            vision = self._parse_vision_result(content)
+
+            # Publish structured vision_result event for agent decision-making
+            if vision.get("victim"):
+                vtype = vision.get("victim_type", "light")
+                self.publish(robot_name, f"vision_result(victim({vtype}))")
+            elif vision.get("obstacle"):
+                self.publish(robot_name, "vision_result(obstacle)")
+            else:
+                self.publish(robot_name, "vision_result(clear)")
+
+            # Also publish raw description for agent logging
+            safe_content = (content.replace("'", "\\'").replace('"', '')
+                            .replace(",", " ").replace("(", "").replace(")", ""))
+            if len(safe_content) > 300:
+                safe_content = safe_content[:297] + "..."
+            self.publish(robot_name, f"vision_analysis('{safe_content}')")
         except Exception as e:
             log.warning("Vision LLM analysis failed for %s: %s", robot_name, e)
+            self.publish(robot_name, "vision_result(clear)")
         finally:
             # Un-gate movement regardless of success/failure.
             rs = self.robots.get(robot_name)
             if rs:
                 rs.waiting_for_vision = False
+
+    def _parse_vision_result(self, content: str) -> dict:
+        """Parse LLM response into a structured dict (JSON then keyword fallback)."""
+        # Try JSON first
+        try:
+            start = content.find('{')
+            end = content.rfind('}')
+            if start >= 0 and end > start:
+                return json.loads(content[start:end + 1])
+        except (json.JSONDecodeError, ValueError):
+            pass
+        # Fallback: keyword matching
+        lower = content.lower()
+        result: dict = {"victim": False, "victim_type": None,
+                        "obstacle": False, "path_clear": True}
+        if any(w in lower for w in ("victim", "red cube", "person", "body",
+                                     "injured", "survivor")):
+            result["victim"] = True
+            result["victim_type"] = ("heavy" if any(w in lower for w in
+                                     ("heavy", "large", "big")) else "light")
+        if any(w in lower for w in ("obstacle", "rock", "block", "debris",
+                                     "barrel", "crate", "stone")):
+            result["obstacle"] = True
+            result["path_clear"] = False
+        if any(w in lower for w in ("blocked", "cannot proceed", "obstruct")):
+            result["path_clear"] = False
+        return result
+
+    def _set_wheels(self, st: RobotState, left_vel: float,
+                    right_vel: float) -> None:
+        """Set wheel velocities (no-op in kinematic mode)."""
+        pass
 
     @staticmethod
     def _wrap_angle(a: float) -> float:

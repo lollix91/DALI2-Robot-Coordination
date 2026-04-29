@@ -98,7 +98,15 @@ def main() -> None:
         print("\n[launch] Shutting down...")
         for proc in reversed(procs):
             try:
-                proc.terminate()
+                if sys.platform == "win32":
+                    # On Windows, terminate the entire process tree
+                    subprocess.call(
+                        ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+                else:
+                    proc.terminate()
                 proc.wait(timeout=5)
             except Exception:
                 try:
@@ -120,7 +128,16 @@ def main() -> None:
         if not args.skip_scene:
             build_scene(args.config, args.pioneer_model)
 
-        # 3. DALI2 server
+        # 3. Bridge (start FIRST so it subscribes to LINDA before agents)
+        print("[launch] Starting CoppeliaSim bridge...")
+        bridge_cmd = [sys.executable, os.path.join(ROOT, "bridge", "coppelia_bridge.py")]
+        if args.config:
+            bridge_cmd += ["--config", args.config]
+        bridge_proc = subprocess.Popen(bridge_cmd, cwd=ROOT)
+        procs.append(bridge_proc)
+        time.sleep(3)  # Give bridge time to connect and subscribe to LINDA
+
+        # 4. DALI2 server (agents will now find the bridge listening)
         print(f"[launch] Starting DALI2 server on port {args.port}...")
         dali2_cmd = [
             "swipl", "-l", SERVER_PL, "-g", "main",
@@ -128,15 +145,6 @@ def main() -> None:
         ]
         dali2_proc = subprocess.Popen(dali2_cmd, cwd=ROOT)
         procs.append(dali2_proc)
-        time.sleep(3)  # Give DALI2 time to start and spawn agents
-
-        # 4. Bridge
-        print("[launch] Starting CoppeliaSim bridge...")
-        bridge_cmd = [sys.executable, os.path.join(ROOT, "bridge", "coppelia_bridge.py")]
-        if args.config:
-            bridge_cmd += ["--config", args.config]
-        bridge_proc = subprocess.Popen(bridge_cmd, cwd=ROOT)
-        procs.append(bridge_proc)
 
         print("[launch] All components started. Press Ctrl+C to stop.")
         print(f"[launch] Web UI: http://localhost:{args.port}")

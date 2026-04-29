@@ -22,11 +22,15 @@ After everything is started:
 2. Each robot has an on-board **vision sensor** (camera). Every few
    seconds the bridge captures a screenshot, saves it to
    `screenshots/<robot_name>/`, and sends the image to a **vision
-   LLM** (GPT4All local server or any OpenAI-compatible API) for
-   analysis.
-3. The LLM describes what it sees; if a victim is detected (green
-   cube = light, red cube = heavy), the information is forwarded to
-   the **coordinator** agent.
+   LLM** (JAN local server or any OpenAI-compatible API) for
+   analysis.  The LLM returns a structured JSON result that the bridge
+   parses into typed events (`vision_result(victim(Type))`,
+   `vision_result(obstacle)`, or `vision_result(clear)`).
+3. Robots autonomously **explore** the arena via patrol waypoints;
+   at each waypoint they pause, photograph their surroundings, and act
+   on the analysis.  If a victim is detected, the information is
+   forwarded to the **coordinator** agent.  If an obstacle is detected,
+   the robot performs an **avoidance manoeuvre**.
 4. The coordinator runs a quick auction: the closest available robot
    wins light victims; the two closest robots cooperate to pick up
    heavy victims.
@@ -194,23 +198,25 @@ top. The bridge captures screenshots every 5 seconds and saves them to
 
 The screenshot is sent as an event to the DALI2 agent (`screenshotE`)
 and, if a vision LLM is reachable, the image is also analysed
-automatically. The LLM responds with a Prolog fact like
-`victim_detected(light)` or `obstacle_ahead`, which the agent uses to
-inform the coordinator.
+automatically.  The bridge requests a structured JSON response and
+parses it into typed events: `vision_result(victim(light))`,
+`vision_result(obstacle)`, or `vision_result(clear)`.  The agent
+uses these to decide whether to report a victim, avoid an obstacle,
+or continue exploring.
 
-### Local vision LLM (GPT4All)
+### Local vision LLM (JAN)
 
-1. Install [GPT4All](https://gpt4all.io/) and enable the local
-   server (default: `http://localhost:4891`).
-2. Load a vision-capable model (e.g. LLaVA).
-3. The bridge and DALI2 will automatically use it.
+1. Install [JAN](https://jan.ai/) and start the local server
+   (default: `http://localhost:1337`).
+2. Load a vision-capable model (e.g. Qwen 2.5 VL, LLaVA).
+3. The bridge will automatically use it.
 
 Environment variables for customisation:
 
 | Variable | Default | Description |
 |---|---|---|
-| `VISION_LLM_ENDPOINT` | `http://localhost:4891/v1/chat/completions` | OpenAI-compatible API |
-| `VISION_LLM_MODEL` | (empty — server picks) | Model name |
+| `VISION_LLM_ENDPOINT` | `http://localhost:1337/v1/chat/completions` | OpenAI-compatible API |
+| `VISION_LLM_MODEL` | `Qwen3_5-9B-IQ4_XS` | Model name |
 | `VISION_LLM_ENABLED` | `true` | Set to `false` to disable |
 
 ### Remote LLM (OpenRouter)
@@ -275,7 +281,7 @@ DALI2-Robot-Coordination\
    |                |                   |  vision capture  |                    |  obstacles  |
    +----------------+                   +--   +-------+  -+                    +-------------+
                                              | Vision |
-                                             | LLM    | (GPT4All / OpenAI-compatible)
+                                             | LLM    | (JAN / OpenAI-compatible)
                                              +--------+
 ```
 

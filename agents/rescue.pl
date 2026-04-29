@@ -285,13 +285,50 @@ vision_analysisE(Description) :>
     log("Bridge vision analysis: ~w", [Description]),
     assert_belief(last_vision_analysis(Description)).
 
+%% --- Structured vision results (the robot acts on these) ---
+
+vision_resultE(victim(Type)) :>
+    believes(robot_id(Me)),
+    believes(pose(X, Y, Th)),
+    log("Vision detected ~w victim ahead", [Type]),
+    %% Estimate victim position ~2m ahead of robot
+    Vx is X + 2.0 * cos(Th),
+    Vy is Y + 2.0 * sin(Th),
+    send(coordinator, victim_seen(vision_detect, Vx, Vy, Type)),
+    ( believes(state(exploring))
+    ->  retract_belief(state(_)),
+        assert_belief(state(idle))
+    ;   true
+    ).
+
+vision_resultE(obstacle) :>
+    believes(robot_id(Me)),
+    log("Vision: obstacle ahead -- avoiding"),
+    send(sim, avoid_obstacle(Me)).
+
+vision_resultE(clear) :>
+    log("Vision: path clear").
+
+%% --- Exploration: patrol the arena when idle ---
+
+exploreI :>
+    believes(state(idle)),
+    believes(robot_id(Me)),
+    believes(battery_level(Bat)),
+    Bat >= 30,
+    log("Starting exploration patrol"),
+    retract_belief(state(_)),
+    assert_belief(state(exploring)),
+    send(sim, explore(Me)).
+internal_event(explore, 5, forever, believes(state(idle)), forever).
+
 %% --- Auction handling ---
 
 request_bidE(Vid, X, Y, _Weight) :>
     %% Compute Manhattan-ish cost = distance + battery penalty.
     believes(robot_id(Me)),
     believes(battery_level(Bat)),
-    ( believes(state(idle)), Bat >= 30
+    ( ( believes(state(idle)) ; believes(state(exploring)) ), Bat >= 30
     ->  ( believes(pose(Px, Py, _))
         ->  Dx is Px - X, Dy is Py - Y, D is sqrt(Dx*Dx + Dy*Dy)
         ;   D = 999
@@ -345,6 +382,11 @@ helper(on_arrive) :-
     ->  %% Arrived at a heavy victim -- wait for partner.
         log("In position for heavy lift on ~w; waiting for ~w", [Vid, Partner]),
         send(coordinator, ready_to_lift(Me, Vid))
+    ; believes(state(exploring))
+    ->  %% Reached exploration waypoint -- wait for vision analysis.
+        log("Exploration waypoint reached -- awaiting vision"),
+        retract_belief(state(_)),
+        assert_belief(state(idle))
     ;   true
     ).
 
@@ -367,7 +409,7 @@ internal_event(battery_monitor, 4, forever, true, forever).
 
 %% Common told/tell.
 told(_, request_bid(_,_,_,_),       100) :- true.
-told(_, rescue_assignment(_,_,_,_), 200) :- believes(state(idle)).
+told(_, rescue_assignment(_,_,_,_), 200) :- ( believes(state(idle)) ; believes(state(exploring)) ).
 told(_, rescue_assignment(_,_,_,_),  50).        %% still queue if busy
 told(_, lift_now(_),                 200) :- true.
 told(_, position(_,_,_),               5) :- true.
@@ -378,6 +420,7 @@ told(_, victim_in_range(_,_,_,_),    150) :- true.
 told(_, delivered(_),                170) :- true.
 told(_, screenshot(_),                30) :- true.
 told(_, vision_analysis(_),           80) :- true.
+told(_, vision_result(_),             90) :- true.
 
 tell(_, _, bid(_,_,_))            :- true.
 tell(_, _, ready_to_lift(_,_))    :- true.
@@ -390,6 +433,8 @@ tell(_, _, attach(_,_))           :- true.
 tell(_, _, release(_,_))          :- true.
 tell(_, _, go_to_depot(_))        :- true.
 tell(_, _, go_to_charger(_))      :- true.
+tell(_, _, explore(_))            :- true.
+tell(_, _, avoid_obstacle(_))     :- true.
 
 %% Helper: process vision LLM result and act on it
 helper(process_vision(victim_detected(Type))) :-
@@ -436,13 +481,31 @@ screenshotE(ImagePath) :>
     believes(robot_id(Me)),
     log("Screenshot captured: ~w", [ImagePath]),
     assert_belief(last_screenshot(ImagePath)).
-    %% Vision analysis is handled by the bridge in a background thread.
 vision_analysisE(Desc) :>
     log("Bridge vision: ~w", [Desc]),
     assert_belief(last_vision_analysis(Desc)).
+vision_resultE(victim(Type)) :>
+    believes(robot_id(Me)), believes(pose(X, Y, Th)),
+    log("Vision detected ~w victim ahead", [Type]),
+    Vx is X + 2.0 * cos(Th), Vy is Y + 2.0 * sin(Th),
+    send(coordinator, victim_seen(vision_detect, Vx, Vy, Type)),
+    ( believes(state(exploring)) -> retract_belief(state(_)),
+        assert_belief(state(idle)) ; true ).
+vision_resultE(obstacle) :>
+    believes(robot_id(Me)),
+    log("Vision: obstacle ahead -- avoiding"),
+    send(sim, avoid_obstacle(Me)).
+vision_resultE(clear) :>
+    log("Vision: path clear").
+exploreI :>
+    believes(state(idle)), believes(robot_id(Me)),
+    believes(battery_level(Bat)), Bat >= 30,
+    retract_belief(state(_)), assert_belief(state(exploring)),
+    send(sim, explore(Me)).
+internal_event(explore, 5, forever, believes(state(idle)), forever).
 request_bidE(Vid, X, Y, _Weight) :>
     believes(robot_id(Me)), believes(battery_level(Bat)),
-    ( believes(state(idle)), Bat >= 30 ->
+    ( ( believes(state(idle)) ; believes(state(exploring)) ), Bat >= 30 ->
         ( believes(pose(Px,Py,_)) ->
             Dx is Px-X, Dy is Py-Y, D is sqrt(Dx*Dx+Dy*Dy)
         ; D=999 ),
@@ -479,6 +542,8 @@ helper(on_arrive) :-
         send(sim, go_to_depot(Me))
     ; believes(target(Vid,_,_,heavy(_))) ->
         send(coordinator, ready_to_lift(Me, Vid))
+    ; believes(state(exploring)) ->
+        retract_belief(state(_)), assert_belief(state(idle))
     ; true ).
 battery_monitorI :>
     believes(battery_level(B)),
@@ -486,7 +551,7 @@ battery_monitorI :>
 internal_event(battery_monitor, 4, forever, true, forever).
 :~ ( believes(battery_level(B)), B >= 5 ).
 told(_, request_bid(_,_,_,_),       100) :- true.
-told(_, rescue_assignment(_,_,_,_), 200) :- believes(state(idle)).
+told(_, rescue_assignment(_,_,_,_), 200) :- ( believes(state(idle)) ; believes(state(exploring)) ).
 told(_, rescue_assignment(_,_,_,_),  50).
 told(_, lift_now(_),                200) :- true.
 told(_, position(_,_,_),              5) :- true.
@@ -497,6 +562,21 @@ told(_, victim_in_range(_,_,_,_),   150) :- true.
 told(_, delivered(_),               170) :- true.
 told(_, screenshot(_),               30) :- true.
 told(_, vision_analysis(_),          80) :- true.
+told(_, vision_result(_),            90) :- true.
+
+tell(_, _, bid(_,_,_))            :- true.
+tell(_, _, ready_to_lift(_,_))    :- true.
+tell(_, _, victim_seen(_,_,_,_))  :- true.
+tell(_, _, victim_rescued(_))     :- true.
+tell(_, _, low_battery(_,_))      :- true.
+tell(_, _, position_update(_,_,_,_)) :- true.
+tell(_, _, set_target(_,_,_))     :- true.
+tell(_, _, attach(_,_))           :- true.
+tell(_, _, release(_,_))          :- true.
+tell(_, _, go_to_depot(_))        :- true.
+tell(_, _, go_to_charger(_))      :- true.
+tell(_, _, explore(_))            :- true.
+tell(_, _, avoid_obstacle(_))     :- true.
 
 helper(process_vision(victim_detected(Type))) :-
     believes(robot_id(Me)), believes(pose(X, Y, _)),
@@ -536,13 +616,31 @@ screenshotE(ImagePath) :>
     believes(robot_id(Me)),
     log("Screenshot captured: ~w", [ImagePath]),
     assert_belief(last_screenshot(ImagePath)).
-    %% Vision analysis is handled by the bridge in a background thread.
 vision_analysisE(Desc) :>
     log("Bridge vision: ~w", [Desc]),
     assert_belief(last_vision_analysis(Desc)).
+vision_resultE(victim(Type)) :>
+    believes(robot_id(Me)), believes(pose(X, Y, Th)),
+    log("Vision detected ~w victim ahead", [Type]),
+    Vx is X + 2.0 * cos(Th), Vy is Y + 2.0 * sin(Th),
+    send(coordinator, victim_seen(vision_detect, Vx, Vy, Type)),
+    ( believes(state(exploring)) -> retract_belief(state(_)),
+        assert_belief(state(idle)) ; true ).
+vision_resultE(obstacle) :>
+    believes(robot_id(Me)),
+    log("Vision: obstacle ahead -- avoiding"),
+    send(sim, avoid_obstacle(Me)).
+vision_resultE(clear) :>
+    log("Vision: path clear").
+exploreI :>
+    believes(state(idle)), believes(robot_id(Me)),
+    believes(battery_level(Bat)), Bat >= 30,
+    retract_belief(state(_)), assert_belief(state(exploring)),
+    send(sim, explore(Me)).
+internal_event(explore, 5, forever, believes(state(idle)), forever).
 request_bidE(Vid, X, Y, _Weight) :>
     believes(robot_id(Me)), believes(battery_level(Bat)),
-    ( believes(state(idle)), Bat >= 30 ->
+    ( ( believes(state(idle)) ; believes(state(exploring)) ), Bat >= 30 ->
         ( believes(pose(Px,Py,_)) ->
             Dx is Px-X, Dy is Py-Y, D is sqrt(Dx*Dx+Dy*Dy)
         ; D=999 ),
@@ -579,6 +677,8 @@ helper(on_arrive) :-
         send(sim, go_to_depot(Me))
     ; believes(target(Vid,_,_,heavy(_))) ->
         send(coordinator, ready_to_lift(Me, Vid))
+    ; believes(state(exploring)) ->
+        retract_belief(state(_)), assert_belief(state(idle))
     ; true ).
 battery_monitorI :>
     believes(battery_level(B)),
@@ -586,7 +686,7 @@ battery_monitorI :>
 internal_event(battery_monitor, 4, forever, true, forever).
 :~ ( believes(battery_level(B)), B >= 5 ).
 told(_, request_bid(_,_,_,_),       100) :- true.
-told(_, rescue_assignment(_,_,_,_), 200) :- believes(state(idle)).
+told(_, rescue_assignment(_,_,_,_), 200) :- ( believes(state(idle)) ; believes(state(exploring)) ).
 told(_, rescue_assignment(_,_,_,_),  50).
 told(_, lift_now(_),                200) :- true.
 told(_, position(_,_,_),              5) :- true.
@@ -597,6 +697,21 @@ told(_, victim_in_range(_,_,_,_),   150) :- true.
 told(_, delivered(_),               170) :- true.
 told(_, screenshot(_),               30) :- true.
 told(_, vision_analysis(_),          80) :- true.
+told(_, vision_result(_),            90) :- true.
+
+tell(_, _, bid(_,_,_))            :- true.
+tell(_, _, ready_to_lift(_,_))    :- true.
+tell(_, _, victim_seen(_,_,_,_))  :- true.
+tell(_, _, victim_rescued(_))     :- true.
+tell(_, _, low_battery(_,_))      :- true.
+tell(_, _, position_update(_,_,_,_)) :- true.
+tell(_, _, set_target(_,_,_))     :- true.
+tell(_, _, attach(_,_))           :- true.
+tell(_, _, release(_,_))          :- true.
+tell(_, _, go_to_depot(_))        :- true.
+tell(_, _, go_to_charger(_))      :- true.
+tell(_, _, explore(_))            :- true.
+tell(_, _, avoid_obstacle(_))     :- true.
 
 helper(process_vision(victim_detected(Type))) :-
     believes(robot_id(Me)), believes(pose(X, Y, _)),
