@@ -224,8 +224,9 @@ victim_in_rangeE(Id, X, Y, Weight) :>
 deliveredE(Id) :>
     believes(robot_id(Me)),
     log("Delivered ~w", [Id]),
-    retract_belief(carrying(_)),
-    retract_belief(state(_)),
+    ( retract_belief(carrying(_)) ; true ),
+    ( retract_belief(target(Id, _, _, _)) ; true ),
+    ( retract_belief(state(_)) ; true ),
     assert_belief(state(idle)),
     send(coordinator, victim_rescued(Id)).
 
@@ -401,8 +402,11 @@ obstacle_detectedE(_D) :> true.
 victim_in_rangeE(Id, X, Y, Weight) :>
     send(coordinator, victim_seen(Id, X, Y, Weight)).
 deliveredE(Id) :>
-    retract_belief(carrying(_)),
-    retract_belief(state(_)),
+    believes(robot_id(Me)),
+    log("Delivered ~w", [Id]),
+    ( retract_belief(carrying(_)) ; true ),
+    ( retract_belief(target(Id, _, _, _)) ; true ),
+    ( retract_belief(state(_)) ; true ),
     assert_belief(state(idle)),
     send(coordinator, victim_rescued(Id)).
 screenshotE(ImagePath) :>
@@ -520,8 +524,11 @@ obstacle_detectedE(_D) :> true.
 victim_in_rangeE(Id, X, Y, Weight) :>
     send(coordinator, victim_seen(Id, X, Y, Weight)).
 deliveredE(Id) :>
-    retract_belief(carrying(_)),
-    retract_belief(state(_)),
+    believes(robot_id(Me)),
+    log("Delivered ~w", [Id]),
+    ( retract_belief(carrying(_)) ; true ),
+    ( retract_belief(target(Id, _, _, _)) ; true ),
+    ( retract_belief(state(_)) ; true ),
     assert_belief(state(idle)),
     send(coordinator, victim_rescued(Id)).
 screenshotE(ImagePath) :>

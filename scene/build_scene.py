@@ -70,8 +70,8 @@ DEFAULT_OBSTACLES = [
 ]
 
 # Vision sensor resolution
-VISION_RES_X = 256
-VISION_RES_Y = 256
+VISION_RES_X = 512
+VISION_RES_Y = 512
 
 
 # --------------------------------------------------------------------------

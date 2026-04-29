@@ -101,7 +101,7 @@ AVOID_COOLDOWN_S  = 1.5     # s -- avoid retrigger oscillations
 ARENA_BOUNDS = (-5.5, 5.5, -5.5, 5.5)  # min_x, max_x, min_y, max_y  (widened)
 EXPLORE_STEP = 2.0                      # grid spacing for patrol waypoints
 
-SCREENSHOT_INTERVAL  = 5.0  # seconds between screenshots per robot
+SCREENSHOT_INTERVAL  = 1.0  # seconds between screenshots per robot
 SCREENSHOT_BASE_DIR  = "screenshots"
 
 # Vision LLM settings (JAN local server or any OpenAI-compatible API)
@@ -141,6 +141,7 @@ class RobotState:
     avoiding: bool = False
     resume_target_xy: Optional[tuple[float, float]] = None
     last_avoid_ts: float = 0.0
+    follow_leader: Optional[str] = None  # formation-follow another robot (heavy carry)
 
 
 @dataclass
@@ -320,13 +321,23 @@ class CoppeliaBridge:
         robot, vid = args[0], args[1]
         rs = self.robots.get(robot)
         vs = self.victims.get(vid)
-        if rs is None or vs is None or vs.delivered:
+        if rs is None or vs is None:
             return
-        # For heavy victims we still attach to one robot; the other moves
-        # in formation.  The DALI2 cooperative-lift constraint guarantees
-        # both robots are physically at the victim before this is invoked.
+        if vs.delivered:
+            # Victim was already rescued -- tell the robot so it goes idle.
+            self.publish(robot, f"delivered({vid})")
+            log.info("Attach %s by %s -- already delivered, notifying robot", vid, robot)
+            return
+        # Heavy pair: if another robot already carries this victim,
+        # this robot becomes the formation follower (rides alongside).
+        if vs.carried_by is not None and vs.carried_by != robot:
+            rs.carrying = vid
+            rs.follow_leader = vs.carried_by
+            log.info("Heavy pair: %s follows leader %s carrying %s",
+                     robot, vs.carried_by, vid)
+            return
+        # First (or only) robot to attach -- physically parent the victim.
         rp = self.sim.getObjectPosition(rs.body_handle, -1)
-        # Lift victim slightly above the robot
         try:
             self.sim.setObjectParent(vs.handle, rs.body_handle, True)
             self.sim.setObjectPosition(vs.handle, rs.body_handle, [0.0, 0.0, 0.30])
@@ -346,7 +357,9 @@ class CoppeliaBridge:
         # Guard against double-release (heavy pair: both robots call release)
         if vs.delivered:
             rs.carrying = None
-            log.info("Release %s by %s -- already delivered, skipping", vid, robot)
+            # Still notify the robot so its Prolog state transitions to idle.
+            self.publish(robot, f"delivered({vid})")
+            log.info("Release %s by %s -- already delivered, notifying robot", vid, robot)
             return
         try:
             self.sim.setObjectParent(vs.handle, -1, True)
@@ -360,17 +373,30 @@ class CoppeliaBridge:
             vs.delivered = True
             vs.carried_by = None
             try:
-                self.sim.setObjectPosition(vs.handle, -1,
-                                           [self.depot_xy[0],
-                                            self.depot_xy[1],
-                                            0.10])
-                # Hide the delivered victim -- no longer visible in simulation
-                self.sim.setObjectInt32Param(
-                    vs.handle, self.sim.objectintparam_visibility_layer, 0)
+                # Remove the delivered victim cube from the scene entirely.
+                self.sim.removeObject(vs.handle)
             except Exception:
-                pass
+                # Fallback: hide via visibility layer if removal fails.
+                try:
+                    self.sim.setObjectPosition(vs.handle, -1,
+                                               [self.depot_xy[0],
+                                                self.depot_xy[1],
+                                                0.10])
+                    self.sim.setObjectInt32Param(
+                        vs.handle,
+                        self.sim.objectintparam_visibility_layer, 0)
+                except Exception:
+                    pass
             self.publish(robot, f"delivered({vid})")
             log.info("Delivered %s at depot via %s", vid, robot)
+            # If this was a heavy pair, also release the follower.
+            for oname, ost in self.robots.items():
+                if ost.follow_leader == robot and ost.carrying == vid:
+                    ost.follow_leader = None
+                    ost.carrying = None
+                    self.publish(oname, f"delivered({vid})")
+                    log.info("Notified follower %s of delivery of %s",
+                             oname, vid)
         else:
             log.info("Released %s at non-depot location (d=%.2f)", vid, d)
 
@@ -463,6 +489,10 @@ class CoppeliaBridge:
             self._capture_screenshot(st)
 
     def _control_robot(self, st: RobotState) -> None:
+        # Formation following for heavy-carry pairs.
+        if st.follow_leader is not None:
+            self._follow_leader(st)
+            return
         try:
             pos = self.sim.getObjectPosition(st.body_handle, -1)
             ori = self.sim.getObjectOrientation(st.body_handle, -1)
@@ -537,6 +567,27 @@ class CoppeliaBridge:
                          st.name, x, y, theta, tx, ty, alpha, v, w)
                 st._ctrl_logged = True
         st.moving = (st.target_xy is not None)
+
+    def _follow_leader(self, st: RobotState) -> None:
+        """Kinematically keep *st* beside its leader during a cooperative carry."""
+        leader = self.robots.get(st.follow_leader)
+        if leader is None:
+            return
+        try:
+            lpos = self.sim.getObjectPosition(leader.body_handle, -1)
+            lori = self.sim.getObjectOrientation(leader.body_handle, -1)
+        except Exception:
+            return
+        ltheta = self._wrap_angle(lori[2] - HEADING_OFFSET)
+        # Stay 0.6 m to the left of the leader.
+        side_angle = ltheta + math.pi / 2
+        fx = lpos[0] + 0.6 * math.cos(side_angle)
+        fy = lpos[1] + 0.6 * math.sin(side_angle)
+        try:
+            self.sim.setObjectPosition(st.body_handle, -1, [fx, fy, ROBOT_Z])
+            self.sim.setObjectOrientation(st.body_handle, -1, lori)
+        except Exception:
+            pass
 
     def _discover_obstacles(self) -> None:
         """Collect static obstacle handles from known scene aliases."""
@@ -655,6 +706,10 @@ class CoppeliaBridge:
         """Capture an image from the robot's vision sensor and save it."""
         if st.camera_handle is None or Image is None:
             return
+        # Don't capture while carrying (camera would see our own green cube)
+        # or while a previous analysis is still running.
+        if st.carrying is not None or st.waiting_for_vision:
+            return
         now = time.time()
         if now - st.last_screenshot < SCREENSHOT_INTERVAL:
             return
@@ -761,7 +816,7 @@ class CoppeliaBridge:
                 headers={"Content-Type": "application/json"},
                 method="POST"
             )
-            with urllib.request.urlopen(req, timeout=30) as resp:
+            with urllib.request.urlopen(req, timeout=10) as resp:
                 result = json.loads(resp.read().decode("utf-8"))
             content = result["choices"][0]["message"]["content"].strip()
             log.info("Vision LLM [%s]: %s", robot_name, content)
