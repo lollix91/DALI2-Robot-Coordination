@@ -96,6 +96,11 @@ MAX_LIN_VEL      = 0.45     # m/s
 MAX_ANG_VEL      = 1.40     # rad/s
 K_RHO            = 1.5
 K_ALPHA          = 4.0
+OBS_DETECT_RADIUS = 1.0     # m -- obstacle trigger distance ahead
+OBS_FRONT_CONE_DEG = 35.0   # deg -- frontal cone for obstacle detection
+AVOID_SIDE_STEP   = 1.2     # m -- lateral detour offset
+AVOID_FWD_STEP    = 0.8     # m -- small forward progress while detouring
+AVOID_COOLDOWN_S  = 1.5     # s -- avoid retrigger oscillations
 
 BATTERY_DRAIN_MOVING = 0.5  # %/s
 BATTERY_DRAIN_IDLE   = 0.05 # %/s
@@ -144,6 +149,9 @@ class RobotState:
     exploring: bool = False
     explore_waypoints: list = field(default_factory=list)
     explore_index: int = 0
+    avoiding: bool = False
+    resume_target_xy: Optional[tuple[float, float]] = None
+    last_avoid_ts: float = 0.0
 
 
 @dataclass
@@ -193,6 +201,7 @@ class CoppeliaBridge:
 
         self.robots: dict[str, RobotState] = {}
         self.victims: dict[str, VictimState] = {}
+        self.obstacles: list[tuple[str, int]] = []
         self.depot_xy = DEPOT_XY
         self.charger_xy = CHARGER_XY
         self.victims_cfg = victims_cfg
@@ -239,6 +248,7 @@ class CoppeliaBridge:
             self.victims[vid] = VictimState(vid=vid, handle=h, weight=weight)
             log.info("Victim %s (%s) ready (handle=%d)", vid, weight, h)
 
+        self._discover_obstacles()
         log.info("Depot=%s  Charger=%s", self.depot_xy, self.charger_xy)
 
     # ----------------------------------------------------------------------
@@ -301,6 +311,8 @@ class CoppeliaBridge:
         st.target_xy = (x, y)
         st.arrived_published = False
         st.exploring = False
+        st.avoiding = False
+        st.resume_target_xy = None
         log.info("Target for %s -> (%.2f, %.2f)", robot, x, y)
 
     def _cmd_go_to_depot(self, args, sender):
@@ -311,6 +323,8 @@ class CoppeliaBridge:
         st.target_xy = self.depot_xy
         st.arrived_published = False
         st.exploring = False
+        st.avoiding = False
+        st.resume_target_xy = None
 
     def _cmd_go_to_charger(self, args, sender):
         robot = args[0]
@@ -320,6 +334,8 @@ class CoppeliaBridge:
         st.target_xy = self.charger_xy
         st.arrived_published = False
         st.exploring = False
+        st.avoiding = False
+        st.resume_target_xy = None
 
     def _cmd_attach(self, args, sender):
         # attach(rescuer_i, victim_id)
@@ -392,6 +408,8 @@ class CoppeliaBridge:
         st.target_xy = wp
         st.arrived_published = False
         st.exploring = True
+        st.avoiding = False
+        st.resume_target_xy = None
         log.info("Explore %s -> waypoint (%.2f, %.2f)", robot, wp[0], wp[1])
 
     def _cmd_avoid_obstacle(self, args, sender):
@@ -406,17 +424,17 @@ class CoppeliaBridge:
         except Exception:
             return
         theta = self._wrap_angle(ori[2] - HEADING_OFFSET)
-        # Step to the right (+90°) and slightly forward
-        avoid_angle = theta + math.pi / 2
-        dist = 2.0
-        ax = pos[0] + dist * math.cos(avoid_angle) + 1.0 * math.cos(theta)
-        ay = pos[1] + dist * math.sin(avoid_angle) + 1.0 * math.sin(theta)
+        if st.target_xy is not None:
+            st.resume_target_xy = st.target_xy
+        ax, ay = self._compute_avoid_waypoint(pos[0], pos[1], theta)
         min_x, max_x, min_y, max_y = ARENA_BOUNDS
         ax = max(min_x, min(max_x, ax))
         ay = max(min_y, min(max_y, ay))
         st.target_xy = (ax, ay)
         st.arrived_published = False
         st.exploring = True   # treat as exploration continuation
+        st.avoiding = True
+        st.last_avoid_ts = time.time()
         log.info("Avoid obstacle %s -> (%.2f, %.2f)", robot, ax, ay)
 
     def _generate_waypoints(self) -> list[tuple[float, float]]:
@@ -477,9 +495,31 @@ class CoppeliaBridge:
             return
         if st.target_xy is not None:
             tx, ty = st.target_xy
+            now = time.time()
+            obs_dist = self._nearest_obstacle_ahead(x, y, theta)
+            if (obs_dist is not None and
+                    (now - st.last_avoid_ts) >= AVOID_COOLDOWN_S and
+                    not st.avoiding):
+                st.resume_target_xy = (tx, ty)
+                ax, ay = self._compute_avoid_waypoint(x, y, theta)
+                st.target_xy = (ax, ay)
+                st.arrived_published = False
+                st.avoiding = True
+                st.last_avoid_ts = now
+                self.publish(st.name, f"obstacle_detected({obs_dist:.2f})")
+                log.info("%s obstacle ahead at %.2fm -> detour (%.2f, %.2f)",
+                         st.name, obs_dist, ax, ay)
+                tx, ty = st.target_xy
             dx, dy = tx - x, ty - y
             rho = math.hypot(dx, dy)
             if rho < ARRIVAL_RADIUS:
+                if st.avoiding and st.resume_target_xy is not None:
+                    st.target_xy = st.resume_target_xy
+                    st.resume_target_xy = None
+                    st.avoiding = False
+                    st.arrived_published = False
+                    log.info("%s detour completed -> resuming mission target", st.name)
+                    return
                 if not st.arrived_published:
                     st.arrived_published = True
                     was_exploring = st.exploring
@@ -515,6 +555,83 @@ class CoppeliaBridge:
                          st.name, x, y, theta, tx, ty, alpha, v, w)
                 st._ctrl_logged = True
         st.moving = (st.target_xy is not None)
+
+    def _discover_obstacles(self) -> None:
+        """Collect static obstacle handles from known scene aliases."""
+        prefixes = ("rock_", "crate_", "barrel_", "debris_")
+        self.obstacles.clear()
+        try:
+            all_objects = self.sim.getObjectsInTree(self.sim.handle_scene,
+                                                    self.sim.handle_all, 0)
+        except Exception:
+            all_objects = []
+        for h in all_objects:
+            try:
+                alias = self.sim.getObjectAlias(h)
+            except Exception:
+                continue
+            if alias and alias.startswith(prefixes):
+                self.obstacles.append((alias, h))
+        if self.obstacles:
+            names = ", ".join(name for name, _ in self.obstacles)
+            log.info("Obstacle map ready: %s", names)
+        else:
+            log.warning("No obstacles discovered; avoidance disabled")
+
+    def _nearest_obstacle_ahead(self, x: float, y: float,
+                                theta: float) -> Optional[float]:
+        """Return nearest obstacle distance ahead in frontal cone."""
+        nearest: Optional[float] = None
+        cone = math.radians(OBS_FRONT_CONE_DEG)
+        for _, h in self.obstacles:
+            try:
+                op = self.sim.getObjectPosition(h, -1)
+            except Exception:
+                continue
+            dx, dy = op[0] - x, op[1] - y
+            dist = math.hypot(dx, dy)
+            if dist <= 1e-6 or dist > OBS_DETECT_RADIUS:
+                continue
+            rel = self._wrap_angle(math.atan2(dy, dx) - theta)
+            if abs(rel) <= cone:
+                if nearest is None or dist < nearest:
+                    nearest = dist
+        return nearest
+
+    def _compute_avoid_waypoint(self, x: float, y: float,
+                                theta: float) -> tuple[float, float]:
+        """Pick left/right detour side using local obstacle density."""
+        left_angle = theta + math.pi / 2
+        right_angle = theta - math.pi / 2
+        lx = x + AVOID_SIDE_STEP * math.cos(left_angle) + AVOID_FWD_STEP * math.cos(theta)
+        ly = y + AVOID_SIDE_STEP * math.sin(left_angle) + AVOID_FWD_STEP * math.sin(theta)
+        rx = x + AVOID_SIDE_STEP * math.cos(right_angle) + AVOID_FWD_STEP * math.cos(theta)
+        ry = y + AVOID_SIDE_STEP * math.sin(right_angle) + AVOID_FWD_STEP * math.sin(theta)
+        lscore = self._waypoint_clearance_score(lx, ly)
+        rscore = self._waypoint_clearance_score(rx, ry)
+        if lscore >= rscore:
+            ax, ay = lx, ly
+        else:
+            ax, ay = rx, ry
+        min_x, max_x, min_y, max_y = ARENA_BOUNDS
+        ax = max(min_x, min(max_x, ax))
+        ay = max(min_y, min(max_y, ay))
+        return ax, ay
+
+    def _waypoint_clearance_score(self, x: float, y: float) -> float:
+        """Higher score means farther from nearby obstacles."""
+        score = 0.0
+        for _, h in self.obstacles:
+            try:
+                op = self.sim.getObjectPosition(h, -1)
+            except Exception:
+                continue
+            d = math.hypot(op[0] - x, op[1] - y)
+            if d < 1e-3:
+                d = 1e-3
+            # Weight close obstacles much more than far ones.
+            score += min(d, 3.0)
+        return score
 
     def _sense_robot(self, st: RobotState) -> None:
         try:
