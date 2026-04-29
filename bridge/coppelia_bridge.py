@@ -12,13 +12,11 @@ Message protocol (LINDA: "TO:CONTENT:FROM"):
     Inbound (TO=sim, FROM=rescuer_i):
         set_target(rescuer_i, X, Y)
         go_to_depot(rescuer_i)
-        go_to_charger(rescuer_i)
         attach(rescuer_i, victim_id)
         release(rescuer_i, victim_id)
 
     Outbound (TO=rescuer_i, FROM=sim):
         position(X, Y, Theta)
-        battery(Level)
         at_target
         obstacle_detected(Distance)
         victim_in_range(Id, X, Y, Weight)
@@ -76,15 +74,12 @@ ROBOT_NAMES = ["rescuer_1", "rescuer_2", "rescuer_3"]
 
 # Each victim: (id, x, y, weight in {"light", "heavy"})
 DEFAULT_VICTIMS = [
-    ("victim_1",  4.0,  3.0, "light"),
-    ("victim_2", -3.5,  2.5, "heavy"),
-    ("victim_3",  0.0, -4.0, "light"),
-    ("victim_4",  4.0, -3.5, "heavy"),
-    ("victim_5", -2.0, -1.5, "light"),
+    ("victim_1",  5.0,  3.0, "light"),
+    ("victim_2", -4.0, -3.0, "heavy"),
+    ("victim_3", -3.0,  4.0, "light"),
 ]
 
 DEPOT_XY    = (0.0,  4.7)
-CHARGER_XY  = (-4.7, -4.7)
 
 DETECTION_RADIUS = 3.0      # m -- victim sensing radius; robots must
                             #   physically explore to discover victims
@@ -102,13 +97,9 @@ AVOID_SIDE_STEP   = 1.2     # m -- lateral detour offset
 AVOID_FWD_STEP    = 0.8     # m -- small forward progress while detouring
 AVOID_COOLDOWN_S  = 1.5     # s -- avoid retrigger oscillations
 
-BATTERY_DRAIN_MOVING = 0.5  # %/s
-BATTERY_DRAIN_IDLE   = 0.05 # %/s
-
 # Arena bounds for exploration waypoints (metres)
-ARENA_BOUNDS = (-4.5, 4.5, -4.5, 4.5)  # min_x, max_x, min_y, max_y
+ARENA_BOUNDS = (-5.5, 5.5, -5.5, 5.5)  # min_x, max_x, min_y, max_y  (widened)
 EXPLORE_STEP = 2.0                      # grid spacing for patrol waypoints
-BATTERY_CHARGE_RATE  = 5.0  # %/s while at charger
 
 SCREENSHOT_INTERVAL  = 5.0  # seconds between screenshots per robot
 SCREENSHOT_BASE_DIR  = "screenshots"
@@ -137,14 +128,12 @@ class RobotState:
     target_xy: Optional[tuple[float, float]] = None
     arrived_published: bool = True
     carrying: Optional[str] = None
-    battery: float = 100.0
     moving: bool = False
     seen_victims: set[str] = field(default_factory=set)
     camera_handle: Optional[int] = None
     last_screenshot: float = 0.0
     screenshot_count: int = 0
     last_pos_publish: float = 0.0
-    last_bat_publish: float = 0.0
     waiting_for_vision: bool = False
     exploring: bool = False
     explore_waypoints: list = field(default_factory=list)
@@ -198,12 +187,12 @@ class CoppeliaBridge:
 
         self.client = RemoteAPIClient()
         self.sim = self.client.require("sim")
+        self._stepping = False  # will be set True after simulation starts
 
         self.robots: dict[str, RobotState] = {}
         self.victims: dict[str, VictimState] = {}
         self.obstacles: list[tuple[str, int]] = []
         self.depot_xy = DEPOT_XY
-        self.charger_xy = CHARGER_XY
         self.victims_cfg = victims_cfg
 
         self._stop = threading.Event()
@@ -249,7 +238,7 @@ class CoppeliaBridge:
             log.info("Victim %s (%s) ready (handle=%d)", vid, weight, h)
 
         self._discover_obstacles()
-        log.info("Depot=%s  Charger=%s", self.depot_xy, self.charger_xy)
+        log.info("Depot=%s", self.depot_xy)
 
     # ----------------------------------------------------------------------
     # Redis pub/sub
@@ -326,17 +315,6 @@ class CoppeliaBridge:
         st.avoiding = False
         st.resume_target_xy = None
 
-    def _cmd_go_to_charger(self, args, sender):
-        robot = args[0]
-        st = self.robots.get(robot)
-        if st is None:
-            return
-        st.target_xy = self.charger_xy
-        st.arrived_published = False
-        st.exploring = False
-        st.avoiding = False
-        st.resume_target_xy = None
-
     def _cmd_attach(self, args, sender):
         # attach(rescuer_i, victim_id)
         robot, vid = args[0], args[1]
@@ -365,6 +343,11 @@ class CoppeliaBridge:
         vs = self.victims.get(vid)
         if rs is None or vs is None:
             return
+        # Guard against double-release (heavy pair: both robots call release)
+        if vs.delivered:
+            rs.carrying = None
+            log.info("Release %s by %s -- already delivered, skipping", vid, robot)
+            return
         try:
             self.sim.setObjectParent(vs.handle, -1, True)
         except Exception as e:
@@ -381,6 +364,9 @@ class CoppeliaBridge:
                                            [self.depot_xy[0],
                                             self.depot_xy[1],
                                             0.10])
+                # Hide the delivered victim -- no longer visible in simulation
+                self.sim.setObjectInt32Param(
+                    vs.handle, self.sim.objectintparam_visibility_layer, 0)
             except Exception:
                 pass
             self.publish(robot, f"delivered({vid})")
@@ -456,6 +442,12 @@ class CoppeliaBridge:
     # ----------------------------------------------------------------------
 
     def control_tick(self) -> None:
+        # Advance the simulation by one step (stepping mode avoids stutter).
+        if self._stepping:
+            try:
+                self.client.step()
+            except Exception:
+                pass
         # Process queued commands from subscription thread (thread-safe).
         while not self._cmd_queue.empty():
             try:
@@ -478,16 +470,6 @@ class CoppeliaBridge:
             return
         x, y = pos[0], pos[1]
         theta = self._wrap_angle(ori[2] - HEADING_OFFSET)
-
-        # Battery dynamics --------------------------------------------------
-        if st.target_xy is not None:
-            st.battery = max(0.0, st.battery - BATTERY_DRAIN_MOVING * self.dt)
-        else:
-            st.battery = max(0.0, st.battery - BATTERY_DRAIN_IDLE * self.dt)
-        # Charge while idle on charger
-        if (st.target_xy is None and
-                math.hypot(x - self.charger_xy[0], y - self.charger_xy[1]) < 0.6):
-            st.battery = min(100.0, st.battery + BATTERY_CHARGE_RATE * self.dt)
 
         # Go-to-goal control (kinematic) ------------------------------------
         if st.waiting_for_vision:
@@ -642,14 +624,11 @@ class CoppeliaBridge:
         x, y = pos[0], pos[1]
         theta = self._wrap_angle(ori[2] - HEADING_OFFSET)
 
-        # Throttled position + battery telemetry.
+        # Throttled position telemetry.
         now = time.time()
         if now - st.last_pos_publish >= 1.0:
             st.last_pos_publish = now
             self.publish(st.name, f"position({x:.3f},{y:.3f},{theta:.3f})")
-        if now - st.last_bat_publish >= 5.0:
-            st.last_bat_publish = now
-            self.publish(st.name, f"battery({st.battery:.0f})")
 
         # Victim detection: announce a victim once when first seen.
         for vs in self.victims.values():
@@ -719,7 +698,21 @@ class CoppeliaBridge:
 
     def _analyse_screenshot(self, robot_name: str, image_path: str,
                             img: "Image.Image") -> None:
-        """Send a screenshot to the vision LLM and publish structured results."""
+        """Send a screenshot to the vision LLM and publish structured results.
+
+        Fast pre-filter: scan the image for fluorescent-green pixels first.
+        Only invoke the (expensive) LLM if green is detected.
+        """
+        # --- Phase 1: fast green-pixel scan (bypasses LLM if no green) ---
+        if not self._has_green_pixels(img):
+            log.info("Vision [%s]: no green pixels detected -- skipping LLM", robot_name)
+            self.publish(robot_name, "vision_result(clear)")
+            rs = self.robots.get(robot_name)
+            if rs:
+                rs.waiting_for_vision = False
+            return
+
+        # --- Phase 2: green detected, invoke LLM -------------------------
         try:
             import urllib.request
             # Encode image as base64 JPEG
@@ -733,8 +726,8 @@ class CoppeliaBridge:
                 '{"victim": false, "victim_type": null, "obstacle": false, '
                 '"path_clear": true}\n'
                 "Rules:\n"
-                "- victim: true if you see a red cube (a person to rescue)\n"
-                '- victim_type: "heavy" if the red cube is large, "light" if small, '
+                "- victim: true if you see a fluorescent-green cube (a person to rescue)\n"
+                '- victim_type: "heavy" if the green cube is large, "light" if small, '
                 "null if no victim\n"
                 "- obstacle: true if there is a brown/grey block or rock directly "
                 "ahead blocking the path\n"
@@ -814,7 +807,8 @@ class CoppeliaBridge:
         lower = content.lower()
         result: dict = {"victim": False, "victim_type": None,
                         "obstacle": False, "path_clear": True}
-        if any(w in lower for w in ("victim", "red cube", "person", "body",
+        if any(w in lower for w in ("victim", "red cube", "green", "green cube",
+                                     "fluorescent", "person", "body",
                                      "injured", "survivor")):
             result["victim"] = True
             result["victim_type"] = ("heavy" if any(w in lower for w in
@@ -826,6 +820,45 @@ class CoppeliaBridge:
         if any(w in lower for w in ("blocked", "cannot proceed", "obstruct")):
             result["path_clear"] = False
         return result
+
+    # ------------------------------------------------------------------
+    # Fast colour pre-filter: detect fluorescent-green in the image
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _has_green_pixels(img: "Image.Image",
+                          min_pixels: int = 6,
+                          sample_fraction: float = 0.10
+                          ) -> bool:
+        """Return True if the image contains at least *min_pixels* of
+        fluorescent-green.
+
+        The check is done on a uniformly-sampled subset (default 10 %)
+        to keep the CPU cost negligible (~1 ms per 256×256 frame).
+
+        Fluorescent-green definition (RGB, 0..255):
+            G >= 200, R <= 100, B <= 100, and (G - R) >= 100
+        """
+        if img is None:
+            return False
+        w, h = img.size
+        total = w * h
+        # For very small images just scan everything.
+        if total <= 1024:
+            step = 1
+        else:
+            step = max(1, int(1.0 / max(sample_fraction, 0.01)))
+        px = img.load()
+        green_count = 0
+        # Walk in scanline order with a fixed stride.
+        for y in range(0, h, step):
+            for x in range(0, w, step):
+                r, g, b = px[x, y][:3]  # strip alpha if present
+                if g >= 200 and r <= 100 and b <= 100 and (g - max(r, b)) >= 100:
+                    green_count += 1
+                    if green_count >= min_pixels:
+                        return True
+        return green_count >= min_pixels
 
     def _set_wheels(self, st: RobotState, left_vel: float,
                     right_vel: float) -> None:
@@ -850,8 +883,17 @@ class CoppeliaBridge:
         try:
             state = self.sim.getSimulationState()
             if state == self.sim.simulation_stopped:
+                self.sim.setStepping(True)
                 self.sim.startSimulation()
-                log.info("Simulation started")
+                self._stepping = True
+                log.info("Simulation started (stepping mode)")
+            else:
+                # Already running — enable stepping anyway
+                try:
+                    self.sim.setStepping(True)
+                    self._stepping = True
+                except Exception:
+                    pass
         except Exception:
             pass
 

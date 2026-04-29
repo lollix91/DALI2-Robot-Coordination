@@ -1,4 +1,4 @@
-# Default search-and-rescue scenario.
+# Simplified search-and-rescue scenario.
 # The build_scene.py and coppelia_bridge.py scripts both accept this file
 # via --config, so you only have to edit it in one place.
 #
@@ -6,8 +6,6 @@
 # "heavy" (heavy victims require two rescuers cooperating to lift).
 
 victims:
-  - { id: victim_1, x:  4.0, y:  3.0, weight: light }
-  - { id: victim_2, x: -3.5, y:  2.5, weight: heavy }
-  - { id: victim_3, x:  0.0, y: -4.0, weight: light }
-  - { id: victim_4, x:  4.0, y: -3.5, weight: heavy }
-  - { id: victim_5, x: -2.0, y: -1.5, weight: light }
+  - { id: victim_1, x:  5.0, y:  3.0, weight: light }
+  - { id: victim_2, x: -4.0, y: -3.0, weight: heavy }
+  - { id: victim_3, x: -3.0, y:  4.0, weight: light }

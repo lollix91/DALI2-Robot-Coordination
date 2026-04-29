@@ -1,5 +1,5 @@
 %% =====================================================================
-%% DALI2 Multi-Robot Search-and-Rescue
+%% DALI2 Multi-Robot Search-and-Rescue (no battery / no charger)
 %%
 %% Three rescuer robots cooperate to locate victims in an arena and bring
 %% them to a safe zone. Some victims are HEAVY and require two robots to
@@ -53,8 +53,7 @@ told(_, accept_proposal(_),       150) :- true.
 told(_, reject_proposal(_),       150) :- true.
 told(_, ready_to_lift(_,_),       140) :- true.
 told(_, bid(_,_,_),               120) :- true.
-told(_, low_battery(_,_),         110) :- true.
-told(_, position_update(_,_,_,_),  10) :- true.
+told(_, position_update(_,_,_),    10) :- true.
 told(_, heartbeat(_),               5) :- true.
 
 %% --- Tell rules ---
@@ -111,25 +110,8 @@ victim_rescuedE(VictimId) :>
     assert_belief(open_tasks(L1)),
     send(monitor, log_event(rescue_complete, coordinator, [VictimId])).
 
-%% A rescuer reports it has insufficient battery.
-low_batteryE(Robot, Level) :>
-    log("Low battery from ~w (~w%)", [Robot, Level]),
-    assert_belief(unavailable(Robot)),
-    %% If this robot was assigned to a task, release it for re-auction.
-    ( believes(assigned(Vid, Robot))
-    ->  log("Releasing task ~w from ~w", [Vid, Robot]),
-        retract_belief(assigned(Vid, Robot)),
-        believes(open_tasks(L0)),
-        ( member(Vid, L0)
-        ->  true
-        ;   retract_belief(open_tasks(L0)),
-            assert_belief(open_tasks([Vid|L0]))
-        )
-    ;   true
-    ).
-
 %% Periodic robot telemetry (low-priority).
-position_updateE(_Robot, _X, _Y, _Bat) :> true.
+position_updateE(_Robot, _X, _Y) :> true.
 heartbeatE(_Robot) :> true.
 
 %% --- Internal events: deliberation ---
@@ -147,7 +129,7 @@ solicit_bidsI :>
     log("Soliciting bids for ~w (weight=~w)", [Vid, W]),
     assert_belief(soliciting(Vid)),
     broadcast(request_bid(Vid, X, Y, W)).
-internal_event(solicit_bids, 2, forever, true, forever).      %% allow re-solicitation if no winners
+internal_event(solicit_bids, 2, forever, true, forever).
 
 %% Award task to lowest-cost bidder (light victim) or two lowest (heavy).
 award_taskI :>
@@ -157,7 +139,9 @@ award_taskI :>
     believes(victim_info(Vid, X, Y, Weight)),
     findall(Cost-R,
             (believes(bid(Vid, R, Cost)),
-             \+ believes(unavailable(R))),
+             \+ believes(assigned(_, R)),
+             \+ (believes(assigned_pair(_, R, _))),
+             \+ (believes(assigned_pair(_, _, R)))),
             Bids),
     sort(Bids, Sorted),
     helper(award(Vid, Weight, Sorted, X, Y)).
@@ -186,10 +170,7 @@ helper(cleanup_bids(Vid)) :-
     retract_belief(bid(Vid, _, _)).
 
 %% Cooperative-lift trigger: both partners are ready within delta-t (=5s,
-%% enforced via past_event(ready_at_t/2,5)).  This is the deliberation
-%% counterpart of DALI's multi-event `within(N)` -- recasting the timing
-%% window as the lifetime of the past confirmation makes the constraint
-%% explicit and inspectable in the past memory.
+%% enforced via past_event(ready_at_t/2,5)).
 sync_liftI :>
     believes(assigned_pair(Vid, R1, R2)),
     believes(ready_at_t(R1, Vid)),
@@ -205,14 +186,6 @@ sync_liftI :>
     send(monitor, log_event(coop_lift, coordinator, [Vid, R1, R2])).
 internal_event(sync_lift, 0, forever, true, forever).
 
-%% Constraint: at least one rescuer must be available while there are
-%% open tasks.  A violation is logged by the engine.
-:~ ( believes(open_tasks([])) ;
-     \+ ( believes(unavailable(rescuer_1)),
-          believes(unavailable(rescuer_2)),
-          believes(unavailable(rescuer_3)) )
-   ).
-
 %% Dedup: known_victim is stored as a belief (not an event), so the
 %% check in victim_seenE uses believes(known_victim(_)) to skip duplicates.
 
@@ -225,7 +198,6 @@ internal_event(sync_lift, 0, forever, true, forever).
 :- agent(rescuer_1, [cycle(1)]).
 
 believes(robot_id(rescuer_1)).
-believes(battery_level(100)).
 believes(state(idle)).
 
 %% Common rescuer rules ---------------------------------------------------
@@ -234,21 +206,8 @@ believes(state(idle)).
 positionE(X, Y, Th) :>
     retract_belief(pose(_,_,_)),
     assert_belief(pose(X, Y, Th)),
-    %% Heartbeat back to coordinator (low priority).
     believes(robot_id(Me)),
-    believes(battery_level(Bat)),
-    send(coordinator, position_update(Me, X, Y, Bat)).
-
-batteryE(Level) :>
-    retract_belief(battery_level(_)),
-    assert_belief(battery_level(Level)),
-    ( Level < 25
-    ->  believes(robot_id(Me)),
-        log("Battery LOW (~w%) -- requesting maintenance", [Level]),
-        send(coordinator, low_battery(Me, Level)),
-        send(sim, go_to_charger(Me))
-    ;   true
-    ).
+    send(coordinator, position_update(Me, X, Y)).
 
 at_targetE :>
     log("At target"),
@@ -258,7 +217,6 @@ at_targetE :>
 obstacle_detectedE(_D) :> true.
 
 victim_in_rangeE(Id, X, Y, Weight) :>
-    %% Forward sighting to coordinator with our identity (used as cost).
     believes(robot_id(Me)),
     log("Spotted victim ~w @(~2f,~2f) weight=~w", [Id, X, Y, Weight]),
     send(coordinator, victim_seen(Id, X, Y, Weight)).
@@ -314,8 +272,6 @@ vision_resultE(clear) :>
 exploreI :>
     believes(state(idle)),
     believes(robot_id(Me)),
-    believes(battery_level(Bat)),
-    Bat >= 30,
     log("Starting exploration patrol"),
     retract_belief(state(_)),
     assert_belief(state(exploring)),
@@ -325,18 +281,17 @@ internal_event(explore, 5, forever, believes(state(idle)), forever).
 %% --- Auction handling ---
 
 request_bidE(Vid, X, Y, _Weight) :>
-    %% Compute Manhattan-ish cost = distance + battery penalty.
+    %% Compute distance-based cost.
     believes(robot_id(Me)),
-    believes(battery_level(Bat)),
-    ( ( believes(state(idle)) ; believes(state(exploring)) ), Bat >= 30
+    ( ( believes(state(idle)) ; believes(state(exploring)) )
     ->  ( believes(pose(Px, Py, _))
         ->  Dx is Px - X, Dy is Py - Y, D is sqrt(Dx*Dx + Dy*Dy)
         ;   D = 999
         ),
-        Cost is D + (100 - Bat) / 10,
+        Cost = D,
         send(coordinator, bid(Vid, Me, Cost)),
         log("Bidding on ~w cost=~2f", [Vid, Cost])
-    ;   log("Skipping bid on ~w (busy or low battery)", [Vid])
+    ;   log("Skipping bid on ~w (busy)", [Vid])
     ).
 
 rescue_assignmentE(Vid, X, Y, light) :>
@@ -390,30 +345,12 @@ helper(on_arrive) :-
     ;   true
     ).
 
-%% Internal: combined trigger using a multi-event with delta-t.
-%% If we got both a `low_battery` self-event AND a fresh `task_assigned`
-%% within 5 seconds, we explicitly defer charging until the task is done.
-%% This is a small, didactic example of multi-events with `within`.
-%% (Disabled by default -- left here as a feature reference.)
-%% low_battery_selfE, rescue_assignmentE(_,_,_,_), within(5) :>
-%%     log("Postponing charging: just received a task").
-
-%% Battery monitor (internal event, every 4s).
-battery_monitorI :>
-    believes(battery_level(B)),
-    ( B < 15 -> log("WARNING: critical battery (~w%)", [B]) ; true ).
-internal_event(battery_monitor, 4, forever, true, forever).
-
-%% Safety constraint.
-:~ ( believes(battery_level(B)), B >= 5 ).
-
 %% Common told/tell.
 told(_, request_bid(_,_,_,_),       100) :- true.
 told(_, rescue_assignment(_,_,_,_), 200) :- ( believes(state(idle)) ; believes(state(exploring)) ).
 told(_, rescue_assignment(_,_,_,_),  50).        %% still queue if busy
 told(_, lift_now(_),                 200) :- true.
 told(_, position(_,_,_),               5) :- true.
-told(_, battery(_),                   20) :- true.
 told(_, at_target,                    50) :- true.
 told(_, obstacle_detected(_),         60) :- true.
 told(_, victim_in_range(_,_,_,_),    150) :- true.
@@ -426,13 +363,11 @@ tell(_, _, bid(_,_,_))            :- true.
 tell(_, _, ready_to_lift(_,_))    :- true.
 tell(_, _, victim_seen(_,_,_,_))  :- true.
 tell(_, _, victim_rescued(_))     :- true.
-tell(_, _, low_battery(_,_))      :- true.
-tell(_, _, position_update(_,_,_,_)) :- true.
+tell(_, _, position_update(_,_,_)) :- true.
 tell(_, _, set_target(_,_,_))     :- true.
 tell(_, _, attach(_,_))           :- true.
 tell(_, _, release(_,_))          :- true.
 tell(_, _, go_to_depot(_))        :- true.
-tell(_, _, go_to_charger(_))      :- true.
 tell(_, _, explore(_))            :- true.
 tell(_, _, avoid_obstacle(_))     :- true.
 
@@ -454,20 +389,13 @@ helper(process_vision(_Other)) :-
 :- agent(rescuer_2, [cycle(1)]).
 
 believes(robot_id(rescuer_2)).
-believes(battery_level(100)).
 believes(state(idle)).
 
 positionE(X, Y, Th) :>
     retract_belief(pose(_,_,_)),
     assert_belief(pose(X, Y, Th)),
-    believes(robot_id(Me)), believes(battery_level(Bat)),
-    send(coordinator, position_update(Me, X, Y, Bat)).
-batteryE(Level) :>
-    retract_belief(battery_level(_)),
-    assert_belief(battery_level(Level)),
-    ( Level < 25 -> believes(robot_id(Me)),
-        send(coordinator, low_battery(Me, Level)),
-        send(sim, go_to_charger(Me)) ; true ).
+    believes(robot_id(Me)),
+    send(coordinator, position_update(Me, X, Y)).
 at_targetE :> assert_belief(reached_target), helper(on_arrive).
 obstacle_detectedE(_D) :> true.
 victim_in_rangeE(Id, X, Y, Weight) :>
@@ -499,17 +427,16 @@ vision_resultE(clear) :>
     log("Vision: path clear").
 exploreI :>
     believes(state(idle)), believes(robot_id(Me)),
-    believes(battery_level(Bat)), Bat >= 30,
     retract_belief(state(_)), assert_belief(state(exploring)),
     send(sim, explore(Me)).
 internal_event(explore, 5, forever, believes(state(idle)), forever).
 request_bidE(Vid, X, Y, _Weight) :>
-    believes(robot_id(Me)), believes(battery_level(Bat)),
-    ( ( believes(state(idle)) ; believes(state(exploring)) ), Bat >= 30 ->
+    believes(robot_id(Me)),
+    ( ( believes(state(idle)) ; believes(state(exploring)) ) ->
         ( believes(pose(Px,Py,_)) ->
             Dx is Px-X, Dy is Py-Y, D is sqrt(Dx*Dx+Dy*Dy)
         ; D=999 ),
-        Cost is D + (100-Bat)/10,
+        Cost = D,
         send(coordinator, bid(Vid, Me, Cost))
     ; true ).
 rescue_assignmentE(Vid, X, Y, light) :>
@@ -545,17 +472,11 @@ helper(on_arrive) :-
     ; believes(state(exploring)) ->
         retract_belief(state(_)), assert_belief(state(idle))
     ; true ).
-battery_monitorI :>
-    believes(battery_level(B)),
-    ( B < 15 -> log("WARNING: critical battery (~w%)", [B]) ; true ).
-internal_event(battery_monitor, 4, forever, true, forever).
-:~ ( believes(battery_level(B)), B >= 5 ).
 told(_, request_bid(_,_,_,_),       100) :- true.
 told(_, rescue_assignment(_,_,_,_), 200) :- ( believes(state(idle)) ; believes(state(exploring)) ).
 told(_, rescue_assignment(_,_,_,_),  50).
 told(_, lift_now(_),                200) :- true.
 told(_, position(_,_,_),              5) :- true.
-told(_, battery(_),                  20) :- true.
 told(_, at_target,                   50) :- true.
 told(_, obstacle_detected(_),        60) :- true.
 told(_, victim_in_range(_,_,_,_),   150) :- true.
@@ -568,13 +489,11 @@ tell(_, _, bid(_,_,_))            :- true.
 tell(_, _, ready_to_lift(_,_))    :- true.
 tell(_, _, victim_seen(_,_,_,_))  :- true.
 tell(_, _, victim_rescued(_))     :- true.
-tell(_, _, low_battery(_,_))      :- true.
-tell(_, _, position_update(_,_,_,_)) :- true.
+tell(_, _, position_update(_,_,_)) :- true.
 tell(_, _, set_target(_,_,_))     :- true.
 tell(_, _, attach(_,_))           :- true.
 tell(_, _, release(_,_))          :- true.
 tell(_, _, go_to_depot(_))        :- true.
-tell(_, _, go_to_charger(_))      :- true.
 tell(_, _, explore(_))            :- true.
 tell(_, _, avoid_obstacle(_))     :- true.
 
@@ -589,20 +508,13 @@ helper(process_vision(_)) :- true.
 :- agent(rescuer_3, [cycle(1)]).
 
 believes(robot_id(rescuer_3)).
-believes(battery_level(100)).
 believes(state(idle)).
 
 positionE(X, Y, Th) :>
     retract_belief(pose(_,_,_)),
     assert_belief(pose(X, Y, Th)),
-    believes(robot_id(Me)), believes(battery_level(Bat)),
-    send(coordinator, position_update(Me, X, Y, Bat)).
-batteryE(Level) :>
-    retract_belief(battery_level(_)),
-    assert_belief(battery_level(Level)),
-    ( Level < 25 -> believes(robot_id(Me)),
-        send(coordinator, low_battery(Me, Level)),
-        send(sim, go_to_charger(Me)) ; true ).
+    believes(robot_id(Me)),
+    send(coordinator, position_update(Me, X, Y)).
 at_targetE :> assert_belief(reached_target), helper(on_arrive).
 obstacle_detectedE(_D) :> true.
 victim_in_rangeE(Id, X, Y, Weight) :>
@@ -634,17 +546,16 @@ vision_resultE(clear) :>
     log("Vision: path clear").
 exploreI :>
     believes(state(idle)), believes(robot_id(Me)),
-    believes(battery_level(Bat)), Bat >= 30,
     retract_belief(state(_)), assert_belief(state(exploring)),
     send(sim, explore(Me)).
 internal_event(explore, 5, forever, believes(state(idle)), forever).
 request_bidE(Vid, X, Y, _Weight) :>
-    believes(robot_id(Me)), believes(battery_level(Bat)),
-    ( ( believes(state(idle)) ; believes(state(exploring)) ), Bat >= 30 ->
+    believes(robot_id(Me)),
+    ( ( believes(state(idle)) ; believes(state(exploring)) ) ->
         ( believes(pose(Px,Py,_)) ->
             Dx is Px-X, Dy is Py-Y, D is sqrt(Dx*Dx+Dy*Dy)
         ; D=999 ),
-        Cost is D + (100-Bat)/10,
+        Cost = D,
         send(coordinator, bid(Vid, Me, Cost))
     ; true ).
 rescue_assignmentE(Vid, X, Y, light) :>
@@ -680,17 +591,11 @@ helper(on_arrive) :-
     ; believes(state(exploring)) ->
         retract_belief(state(_)), assert_belief(state(idle))
     ; true ).
-battery_monitorI :>
-    believes(battery_level(B)),
-    ( B < 15 -> log("WARNING: critical battery (~w%)", [B]) ; true ).
-internal_event(battery_monitor, 4, forever, true, forever).
-:~ ( believes(battery_level(B)), B >= 5 ).
 told(_, request_bid(_,_,_,_),       100) :- true.
 told(_, rescue_assignment(_,_,_,_), 200) :- ( believes(state(idle)) ; believes(state(exploring)) ).
 told(_, rescue_assignment(_,_,_,_),  50).
 told(_, lift_now(_),                200) :- true.
 told(_, position(_,_,_),              5) :- true.
-told(_, battery(_),                  20) :- true.
 told(_, at_target,                   50) :- true.
 told(_, obstacle_detected(_),        60) :- true.
 told(_, victim_in_range(_,_,_,_),   150) :- true.
@@ -703,13 +608,11 @@ tell(_, _, bid(_,_,_))            :- true.
 tell(_, _, ready_to_lift(_,_))    :- true.
 tell(_, _, victim_seen(_,_,_,_))  :- true.
 tell(_, _, victim_rescued(_))     :- true.
-tell(_, _, low_battery(_,_))      :- true.
-tell(_, _, position_update(_,_,_,_)) :- true.
+tell(_, _, position_update(_,_,_)) :- true.
 tell(_, _, set_target(_,_,_))     :- true.
 tell(_, _, attach(_,_))           :- true.
 tell(_, _, release(_,_))          :- true.
 tell(_, _, go_to_depot(_))        :- true.
-tell(_, _, go_to_charger(_))      :- true.
 tell(_, _, explore(_))            :- true.
 tell(_, _, avoid_obstacle(_))     :- true.
 

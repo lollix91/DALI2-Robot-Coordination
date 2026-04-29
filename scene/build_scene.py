@@ -44,21 +44,18 @@ log = logging.getLogger("scene")
 # Layout (metres) -----------------------------------------------------------
 
 ROBOT_SPAWNS = [
-    ("rescuer_1", -1.5, -2.5,  0.0),
-    ("rescuer_2",  0.0, -2.5,  0.0),
-    ("rescuer_3",  1.5, -2.5,  0.0),
+    ("rescuer_1", -5.0, -5.0,  math.pi / 4),   # NE-facing (45°)
+    ("rescuer_2",  5.0, -5.0, -math.pi / 4),   # NW-facing (-45°)
+    ("rescuer_3",  0.0,  5.0,  math.pi),       # South-facing (180°)
 ]
 
 DEFAULT_VICTIMS = [
-    ("victim_1",  4.0,  3.0, "light"),
-    ("victim_2", -3.5,  2.5, "heavy"),
-    ("victim_3",  0.0, -4.0, "light"),
-    ("victim_4",  4.0, -3.5, "heavy"),
-    ("victim_5", -2.0, -1.5, "light"),
+    ("victim_1",  5.0,  3.0, "light"),
+    ("victim_2", -4.0, -3.0, "heavy"),
+    ("victim_3", -3.0,  4.0, "light"),
 ]
 
 DEPOT_XY    = (0.0,  4.7)
-CHARGER_XY  = (-4.7, -4.7)
 
 # Obstacles (placed before victims to create a more realistic scene)
 DEFAULT_OBSTACLES = [
@@ -205,14 +202,14 @@ def load_pioneer(sim, model_path: str, alias: str,
 
 def make_victim(sim, vid: str, x: float, y: float, weight: str) -> int:
     safe_remove(sim, vid)
-    # All victims are red cuboids; heavy ones are larger.
+    # All victims are fluorescent-green cuboids; heavy ones are larger.
     if weight == "heavy":
         size = [0.45, 0.45, 0.45]
-        color = [0.90, 0.10, 0.10]
+        color = [0.05, 0.95, 0.05]  # fluorescent green
         z = 0.225
     else:
         size = [0.30, 0.30, 0.30]
-        color = [0.95, 0.20, 0.15]
+        color = [0.05, 0.95, 0.05]  # fluorescent green
         z = 0.150
     h = sim.createPrimitiveShape(sim.primitiveshape_cuboid, size, 0)
     sim.setObjectAlias(h, vid)
@@ -386,9 +383,8 @@ def main() -> None:
     for vid, x, y, weight in load_victims_cfg(args.config):
         make_victim(sim, vid, x, y, weight)
 
-    # 4. Markers (depot, charger) -------------------------------------------
+    # 4. Depot marker -------------------------------------------
     make_marker(sim, "depot",   DEPOT_XY[0],   DEPOT_XY[1],   [0.20, 0.40, 0.95])
-    make_marker(sim, "charger", CHARGER_XY[0], CHARGER_XY[1], [0.95, 0.85, 0.10])
 
     log.info("Scene built. You can now press 'Play' in CoppeliaSim or let the "
              "bridge start the simulation automatically.")
