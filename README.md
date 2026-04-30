@@ -9,6 +9,9 @@ Edu. A small Python program glues the two together.
 > **Quick start:** open CoppeliaSim with a new scene, then run
 > `python launch.py` — it starts Redis, builds the scene, launches
 > DALI2 and the bridge in one shot.  See section 3 for details.
+>
+> **Vision options:** By default uses Jan local server. To use OpenRouter instead:
+> `python launch.py --openrouter sk-or-...`
 
 ---
 
@@ -38,8 +41,6 @@ After everything is started:
    heavy victims.
 5. Robots drive their victim to the **blue depot**. When they arrive,
    the box turns into a delivered task.
-6. If a robot's battery drops below 25%, it heads to the
-   **yellow charger** and is excluded from the next auction.
 
 You can watch the agents' beliefs, past events and live logs in your
 browser at <http://localhost:8080>.
@@ -85,6 +86,13 @@ cd D:\Repository\DALI2-Robot-Coordination
 python launch.py
 ```
 
+**Vision options:**
+- **Default (Jan local):** Requires Jan running with a vision model (Qwen, LLaVA, etc.)
+- **OpenRouter:** Pass your API key to use gpt-4o instead:
+  ```powershell
+  python launch.py --openrouter sk-or-v1-abc123...
+  ```
+
 This starts Redis, builds the scene (with obstacles + vision sensors),
 launches DALI2, and starts the bridge — all in one go.  Press
 `Ctrl+C` to stop everything.
@@ -96,6 +104,9 @@ python launch.py --skip-redis          # Redis already running
 python launch.py --skip-scene          # scene already built
 python launch.py --config scene\scenario.yaml
 python launch.py --pioneer-model "C:\Program Files\CoppeliaRobotics\CoppeliaSimEdu\models\robots\mobile\pioneer p3dx.ttm"
+python launch.py --openrouter sk-or... # Use OpenRouter instead of Jan
+python launch.py --port 8080           # DALI2 HTTP server port (default: 8080)
+python launch.py --agent-file agents\rescue.pl  # Path to DALI2 agent file
 ```
 
 ### Option B — Step by step (four terminals)
@@ -176,9 +187,9 @@ Edit `scene\scenario.yaml` to change victim positions/weights:
 
 ```yaml
 victims:
-  - { id: victim_1, x:  4.0, y:  3.0, weight: light }
-  - { id: victim_2, x: -3.5, y:  2.5, weight: heavy }
-  ...
+  - { id: victim_1, x:  5.0, y:  3.0, weight: light }
+  - { id: victim_2, x: -4.0, y: -3.0, weight: heavy }
+  - { id: victim_3, x: -3.0, y:  4.0, weight: light }
 ```
 
 Then re-run the **scene builder and the bridge** with `--config`:
@@ -188,6 +199,11 @@ python scene\build_scene.py        --config scene\scenario.yaml
 python bridge\coppelia_bridge.py   --config scene\scenario.yaml
 ```
 
+Optional scene builder flags:
+```powershell
+python scene\build_scene.py --keep-current    # Don't stop simulation before building
+```
+
 (You don't need to restart Redis or DALI2 for scenario changes.)
 
 ---
@@ -195,7 +211,7 @@ python bridge\coppelia_bridge.py   --config scene\scenario.yaml
 ## 7. Vision system
 
 Each robot has a **CoppeliaSim vision sensor** (camera) mounted on
-top. The bridge captures screenshots every 5 seconds and saves them to
+top. The bridge captures screenshots every 1 second and saves them to
 `screenshots/<robot>/imageN.jpg`.
 
 The screenshot is sent as an event to the DALI2 agent (`screenshotE`)
@@ -206,12 +222,12 @@ parses it into typed events: `vision_result(victim(light))`,
 uses these to decide whether to report a victim, avoid an obstacle,
 or continue exploring.
 
-### Local vision LLM (JAN)
+### Option A — Jan local server (default)
 
 1. Install [JAN](https://jan.ai/) and start the local server
    (default: `http://localhost:1337`).
 2. Load a vision-capable model (e.g. Qwen 2.5 VL, LLaVA).
-3. The bridge will automatically use it.
+3. Run `python launch.py` — the bridge will automatically use Jan.
 
 Environment variables for customisation:
 
@@ -219,19 +235,35 @@ Environment variables for customisation:
 |---|---|---|
 | `VISION_LLM_ENDPOINT` | `http://localhost:1337/v1/chat/completions` | OpenAI-compatible API |
 | `VISION_LLM_MODEL` | `Qwen3_5-9B-IQ4_XS` | Model name |
+| `VISION_LLM_API_KEY` | `` (empty) | API key if required |
+| `VISION_LLM_TIMEOUT` | `15` | Request timeout in seconds |
 | `VISION_LLM_ENABLED` | `true` | Set to `false` to disable |
 
-### Remote LLM (OpenRouter)
+### Option B — OpenRouter (remote)
 
-DALI2 also ships with an **AI Oracle** for text-based triage via
-[OpenRouter](https://openrouter.ai):
+To use OpenRouter's gpt-4o instead of Jan:
 
 ```powershell
-$env:OPENROUTER_API_KEY = "sk-or-..."
+python launch.py --openrouter sk-or-v1-abc123...
+```
+
+Or set environment variables manually:
+
+```powershell
+$env:VISION_LLM_ENDPOINT = "https://openrouter.ai/api/v1/chat/completions"
+$env:VISION_LLM_MODEL = "openai/gpt-4o"
+$env:VISION_LLM_API_KEY = "sk-or-..."
 python launch.py
 ```
 
-Without a key the system runs in pure-symbolic mode.
+### Option C — Disabled (pure-symbolic mode)
+
+To run without any vision LLM:
+
+```powershell
+$env:VISION_LLM_ENABLED = "false"
+python launch.py
+```
 
 ---
 
@@ -278,8 +310,8 @@ DALI2-Robot-Coordination\
    | (SWI-Prolog)   |   LINDA channel   |  (10 Hz control) |                    | digital     |
    |                |                   |                  |                    | twin        |
    |  coordinator   |                   |  go-to-goal      |                    |             |
-   |  rescuer_1..3  |                   |  battery model   |                    |  Pioneer +  |
-   |  monitor       |                   |  victim sensor   |                    |  victims +  |
+   |  rescuer_1..3  |                   |  victim sensor   |                    |  Pioneer +  |
+   |  monitor       |                   |  vision capture  |                    |  victims +  |
    |                |                   |  vision capture  |                    |  obstacles  |
    +----------------+                   +--   +-------+  -+                    +-------------+
                                              | Vision |
