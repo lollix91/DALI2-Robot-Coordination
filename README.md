@@ -351,5 +351,6 @@ The instructions are identical, except:
 
 ## 12. Citing
 
-If you use this case study in academic work, please cite the
-accompanying CARLA paper.
+Logic-Based Multi-Robot Coordination in Digital Twins: A DALI2 + CoppeliaSim Case Study for Cooperative Search and Rescue,
+Lorenzo De Lauretis, Giovanni De Gasperis and Stefania Costantini,
+Submitted to C.A.R.L.A. Workshop - Lisbon - July 18, 2026
