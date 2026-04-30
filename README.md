@@ -14,6 +14,8 @@ Edu. A small Python program glues the two together.
 
 ## 1. What you will see when it works
 
+![DALI2 Coordination Demo](DALI2_Coordination.gif)
+
 After everything is started:
 
 1. In **CoppeliaSim** three Pioneer P3DX robots start driving around
